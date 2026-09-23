@@ -5751,6 +5751,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   ): string | null {
     const itemId = parsed.item.id;
     if (!parsed.threadId) return null;
+    if (timelineItem.type !== "assistant_message" && timelineItem.type !== "reasoning") {
+      this.emitProviderSubagentTimeline(parsed.threadId, timelineItem);
+      return null;
+    }
     const match = this.findPendingCodexTextStream(
       timelineItem,
       itemId,
@@ -6449,14 +6453,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.replayPendingSubAgentNotifications(registeredChildThreadIds);
       return;
     }
-    if (
-      this.consumeStreamedTextCompletion(
-        timelineItem,
-        itemId,
-        parsed.threadId,
-        parsed.turnId,
-      )
-    ) {
+    if (this.consumeStreamedTextCompletion(timelineItem, itemId, parsed.threadId, parsed.turnId)) {
       if (timelineItem.type === "assistant_message") {
         this.pendingAssistantMessageBoundary = true;
       }
@@ -6502,6 +6499,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     threadId: string | null,
     turnId: string | null,
   ): boolean {
+    if (timelineItem.type !== "assistant_message" && timelineItem.type !== "reasoning") {
+      return false;
+    }
     const match = this.findPendingCodexTextStream(timelineItem, itemId, threadId, turnId);
     if (!match) {
       return false;
@@ -6532,7 +6532,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       ? {
           type: timelineItem.type,
           text: suffix,
-          ...(streamedItemId ?? timelineItem.messageId
+          ...((streamedItemId ?? timelineItem.messageId)
             ? { messageId: streamedItemId ?? timelineItem.messageId }
             : {}),
         }
@@ -6553,11 +6553,14 @@ export class CodexAppServerAgentSession implements AgentSession {
       timelineItem.type === "assistant_message"
         ? this.pendingAgentMessageContexts
         : this.pendingReasoningContexts;
-    const exactText = itemId
-      ? timelineItem.type === "assistant_message"
-        ? this.pendingAgentMessages.get(itemId)
-        : this.pendingReasoning.get(itemId)?.join("")
-      : undefined;
+    let exactText: string | undefined;
+    if (itemId) {
+      if (timelineItem.type === "assistant_message") {
+        exactText = this.pendingAgentMessages.get(itemId);
+      } else {
+        exactText = this.pendingReasoning.get(itemId)?.join("");
+      }
+    }
     if (exactText !== undefined) {
       return { itemId: itemId!, text: exactText };
     }
@@ -6567,10 +6570,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     const pendingEntries: Iterable<readonly [string, string]> =
       timelineItem.type === "assistant_message"
         ? this.pendingAgentMessages.entries()
-        : Array.from(this.pendingReasoning.entries(), ([candidateItemId, chunks]) => [
-            candidateItemId,
-            chunks.join(""),
-          ] as const);
+        : Array.from(
+            this.pendingReasoning.entries(),
+            ([candidateItemId, chunks]) => [candidateItemId, chunks.join("")] as const,
+          );
     const candidates: PendingCodexTextStreamMatch[] = [];
     for (const [candidateItemId, text] of pendingEntries) {
       if (candidateItemId === itemId) continue;
@@ -6614,10 +6617,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     });
   }
 
-  private deletePendingCodexTextStream(
-    timelineItem: AgentTimelineItem,
-    itemId: string,
-  ): void {
+  private deletePendingCodexTextStream(timelineItem: AgentTimelineItem, itemId: string): void {
     if (timelineItem.type === "assistant_message") {
       this.pendingAgentMessages.delete(itemId);
       this.pendingAgentMessageContexts.delete(itemId);
