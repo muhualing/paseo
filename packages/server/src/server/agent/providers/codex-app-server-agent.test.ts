@@ -2569,6 +2569,45 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("merges a completed assistant item whose ID differs from its stream ID", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "native-turn" },
+    });
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "test-thread",
+      itemId: "stream-item",
+      delta: "Hello ",
+    });
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "test-thread",
+      itemId: "stream-item",
+      delta: "world",
+    });
+    asInternals(session).handleNotification("item/completed", {
+      threadId: "test-thread",
+      turnId: "native-turn",
+      item: {
+        type: "agentMessage",
+        id: "completed-item",
+        text: "Hello world",
+      },
+    });
+
+    expect(
+      events
+        .filter((event) => event.type === "timeline" && event.item.type === "assistant_message")
+        .map((event) => event.item),
+    ).toEqual([
+      { type: "assistant_message", messageId: "stream-item", text: "Hello " },
+      { type: "assistant_message", messageId: "stream-item", text: "world" },
+    ]);
+  });
+
   test("folds child-thread Codex activity into the parent sub-agent tool call", () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
