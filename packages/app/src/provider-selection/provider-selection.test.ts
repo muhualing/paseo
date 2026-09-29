@@ -164,6 +164,13 @@ describe("combined model selector data", () => {
     ]);
   });
 
+  it("does not offer cached models from a failed provider", () => {
+    const [provider] = buildSelectableProviderSelectorProviders([
+      snapshotEntry({ provider: "codex", status: "error", error: "probe failed" }),
+    ]);
+    expect(provider?.modelSelection).toEqual({ kind: "error", message: "probe failed" });
+  });
+
   it("builds selector providers from an already-curated provider list", () => {
     const providerDefinitions: AgentProviderDefinition[] = [
       {

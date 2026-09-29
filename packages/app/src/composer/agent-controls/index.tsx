@@ -1850,10 +1850,12 @@ export function DraftAgentControls({
     [models],
   );
 
-  // The draft form is the one surface that can switch provider, so every profile
-  // the host can actually run is offered here.
+  // The draft form can switch providers; failed providers cannot apply a profile.
   const profileProviders = useMemo(
-    () => modelSelectorProviders.map((entry) => entry.id),
+    () =>
+      modelSelectorProviders
+        .filter((entry) => entry.modelSelection.kind !== "error")
+        .map((entry) => entry.id),
     [modelSelectorProviders],
   );
   const profileTarget = useMemo<AgentProfileApplyTarget>(
