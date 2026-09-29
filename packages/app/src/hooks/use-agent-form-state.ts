@@ -314,13 +314,13 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
   const applyProfileFromUser = useCallback(
     (profile: MaterializedAgentProfile) => {
       const provider = profile.provider as AgentProvider;
-      if (!selectableProviderDefinitionMap.has(provider)) {
+      if (!snapshotResolvableProviderDefinitionMap.has(provider)) {
         return;
       }
 
       const previousProvider = formState.provider;
-      const providerDef = selectableProviderDefinitionMap.get(provider);
-      const providerModels = allProviderModels.get(provider) ?? null;
+      const providerDef = snapshotResolvableProviderDefinitionMap.get(provider);
+      const providerModels = snapshotProviderModelsByProvider.get(provider) ?? null;
       const providerPrefs = preferenceOverlayRef.current.current().providerPreferences?.[provider];
       const action = {
         type: "APPLY_PROFILE_FROM_USER" as const,
@@ -355,11 +355,11 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
       });
     },
     [
-      allProviderModels,
       formState,
       providerDefinitionMap,
       resolution,
-      selectableProviderDefinitionMap,
+      snapshotProviderModelsByProvider,
+      snapshotResolvableProviderDefinitionMap,
       updateCurrentPreferences,
       userModified,
     ],

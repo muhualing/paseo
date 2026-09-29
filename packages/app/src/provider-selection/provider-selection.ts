@@ -104,6 +104,16 @@ function buildEntryModelSelection(
   entry: ProviderSnapshotEntry,
   label: string,
 ): ProviderModelSelection {
+  if (entry.status === "error" || entry.status === "unavailable") {
+    return {
+      kind: "error",
+      message:
+        entry.error ??
+        (entry.status === "unavailable"
+          ? i18n.t("providerSelection.unavailable")
+          : i18n.t("providerSelection.unknownError")),
+    };
+  }
   if ((entry.models?.length ?? 0) > 0) {
     return buildModelSelection(entry.provider, label, entry.models ?? null);
   }
@@ -113,14 +123,7 @@ function buildEntryModelSelection(
   if (entry.status === "loading") {
     return { kind: "loading" };
   }
-  return {
-    kind: "error",
-    message:
-      entry.error ??
-      (entry.status === "unavailable"
-        ? i18n.t("providerSelection.unavailable")
-        : i18n.t("providerSelection.unknownError")),
-  };
+  return { kind: "loading" };
 }
 
 export function buildProviderSelectorProviders(input: {
