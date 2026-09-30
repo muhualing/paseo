@@ -172,7 +172,9 @@ export class AgentStorage {
     binding: SubmittedPromptBinding,
   ): Promise<void> {
     await this.load();
-    const validated = SubmittedPromptBindingsSchema.parse([binding])[0];
+    const candidate = SubmittedPromptBindingsSchema.safeParse([binding]);
+    if (!candidate.success) return;
+    const validated = candidate.data[0];
     await this.queueRecordMutation(agentId, (existing) => {
       if (!existing) throw new Error("Cannot bind a prompt without its stored session");
       const parsed = SubmittedPromptBindingsSchema.safeParse(
@@ -189,9 +191,10 @@ export class AgentStorage {
           entry.clientMessageId === validated.clientMessageId &&
           entry.textSha256 === validated.textSha256,
       );
-      return duplicate
+      const appended = SubmittedPromptBindingsSchema.safeParse([...bindings, validated]);
+      return duplicate || !appended.success
         ? existing
-        : { ...existing, submittedPromptBindings: [...bindings, validated] };
+        : { ...existing, submittedPromptBindings: appended.data };
     });
   }
 

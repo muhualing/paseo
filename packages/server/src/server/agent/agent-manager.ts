@@ -1,5 +1,7 @@
 import { projectTimelineRows } from "./timeline-projection.js";
 import {
+  MAX_SUBMITTED_PROMPT_BINDINGS,
+  MAX_SUBMITTED_PROMPT_ID_LENGTH,
   promptTextSha256,
   restoreSubmittedPromptProvenance,
   type SubmittedPromptBinding,
@@ -390,6 +392,12 @@ function resolveInitialAttention(input: AttentionState | undefined): AttentionSt
   };
 }
 
+interface AcceptedSubmittedPrompt {
+  sessionId: string;
+  turnId: string;
+  textSha256: string;
+}
+
 interface StreamEventFlags {
   shouldDispatchEvent: boolean;
   shouldNotifyWaiters: boolean;
@@ -728,6 +736,12 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
+  // Rendering a user message does not prove provider admission. These one-use grants
+  // belong to the live session object and cannot survive reload or terminal events.
+  private readonly acceptedSubmittedPrompts = new WeakMap<
+    ActiveManagedAgent,
+    Map<string, AcceptedSubmittedPrompt | null>
+  >();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -2544,11 +2558,13 @@ export class AgentManager {
             (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
               event.type === "timeline" &&
               event.item.type === "user_message" &&
-              event.item.clientMessageId === options.clientMessageId,
+              event.item.clientMessageId === options.clientMessageId &&
+              event.item.text === submittedPromptText(prompt) &&
+              (!event.turnId || event.turnId === turnId),
           )
         : undefined;
       if (options?.clientMessageId) {
-        this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
+        this.recordAcceptedSubmittedPrompt(agent, prompt, options.clientMessageId, {
           messageId: options.clientMessageId,
           turnId,
           providerMessageId:
@@ -2663,6 +2679,7 @@ export class AgentManager {
     if (fromHistory) return "stale";
     if (!agent.activeTurnId) return "untracked";
     if (turnId && agent.activeTurnId !== turnId) return "stale";
+    this.acceptedSubmittedPrompts.delete(agent);
     agent.activeTurnId = null;
     agent.activeTurnStartedAt = null;
     return "closed_current";
@@ -2855,7 +2872,7 @@ export class AgentManager {
     if (!clientMessageId) {
       return;
     }
-    this.recordSubmittedPrompt(agent, prompt, clientMessageId, {
+    this.recordAcceptedSubmittedPrompt(agent, prompt, clientMessageId, {
       messageId: clientMessageId,
       turnId: expectedTurnId,
     });
@@ -4413,7 +4430,8 @@ export class AgentManager {
     options: { fromHistory?: boolean } | undefined;
     flags: StreamEventFlags;
   }): Promise<void> {
-    const { agent, event, options, flags } = params;
+    const { agent, options, flags } = params;
+    let { event } = params;
 
     if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
       flags.shouldDispatchEvent = false;
@@ -4422,6 +4440,7 @@ export class AgentManager {
     }
 
     if (
+      !options?.fromHistory &&
       event.item.type === "user_message" &&
       event.item.clientMessageId &&
       this.reconcileSubmittedPromptEcho(agent, event.item, event.turnId)
@@ -4429,6 +4448,19 @@ export class AgentManager {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
+    }
+
+    if (event.item.type === "user_message" && event.item.clientMessageId) {
+      // Untrusted echoes may carry a client ID. Restore only a durable native binding,
+      // and clone the projection so provider history remains unchanged.
+      const { clientMessageId: _untrusted, ...nativeItem } = event.item;
+      event = {
+        ...event,
+        item: restoreSubmittedPromptProvenance(
+          nativeItem,
+          await this.getSubmittedPromptBindings(agent),
+        ),
+      };
     }
 
     if (options?.fromHistory) {
@@ -4687,23 +4719,54 @@ export class AgentManager {
     return event;
   }
 
+  private recordAcceptedSubmittedPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    clientMessageId: string,
+    options: { messageId?: string; providerMessageId?: string; turnId: string },
+  ): void {
+    const sessionId = agent.session.describePersistence()?.sessionId;
+    if (sessionId && clientMessageId.length <= MAX_SUBMITTED_PROMPT_ID_LENGTH) {
+      let grants = this.acceptedSubmittedPrompts.get(agent);
+      if (!grants) {
+        grants = new Map();
+        this.acceptedSubmittedPrompts.set(agent, grants);
+      }
+      if (grants.has(clientMessageId) || grants.size < MAX_SUBMITTED_PROMPT_BINDINGS) {
+        grants.set(
+          clientMessageId,
+          grants.has(clientMessageId)
+            ? null
+            : {
+                sessionId,
+                turnId: options.turnId,
+                textSha256: promptTextSha256(submittedPromptText(prompt)),
+              },
+        );
+      }
+    }
+    this.recordSubmittedPrompt(agent, prompt, clientMessageId, options);
+    if (options.providerMessageId) {
+      this.reconcileSubmittedPromptEcho(
+        agent,
+        {
+          type: "user_message",
+          text: submittedPromptText(prompt),
+          clientMessageId,
+          messageId: options.providerMessageId,
+        },
+        options.turnId,
+      );
+    }
+  }
+
   private recordSubmittedPrompt(
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
-    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
-    if (existing) {
-      if (
-        options?.providerMessageId &&
-        existing.item.type === "user_message" &&
-        existing.item.text === submittedPromptText(prompt)
-      ) {
-        this.persistSubmittedPromptBinding(agent, existing.item, options.providerMessageId);
-      }
-      return;
-    }
+    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) return;
     this.touchUpdatedAt(agent);
     agent.lastUserMessageAt = new Date();
     const item: AgentTimelineItem = {
@@ -4713,9 +4776,6 @@ export class AgentManager {
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
-    if (options?.providerMessageId) {
-      this.persistSubmittedPromptBinding(agent, item, options.providerMessageId);
-    }
   }
 
   private reconcileSubmittedPromptEcho(
@@ -4724,27 +4784,28 @@ export class AgentManager {
     turnId?: string,
   ): AgentTimelineRow | null {
     const { clientMessageId, messageId } = item;
-    if (!clientMessageId) return null;
-    let existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
-    const wasSubmitted = existing !== null;
-    if (!existing) {
-      this.recordSubmittedPrompt(agent, item.text, clientMessageId, {
-        messageId: clientMessageId,
-        ...(turnId ? { turnId } : {}),
-      });
-      existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
-    }
-    if (!existing || existing.item.type !== "user_message") return null;
-    if (existing.item.text !== item.text) return null;
-    if (messageId) {
-      const enriched = this.timelineStore.enrichSubmittedUserMessage(
-        agent.id,
-        clientMessageId,
-        messageId,
-      );
-      if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
-      if (wasSubmitted) this.persistSubmittedPromptBinding(agent, item, messageId);
-    }
+    if (!clientMessageId || !messageId) return null;
+    const grants = this.acceptedSubmittedPrompts.get(agent);
+    const grant = grants?.get(clientMessageId);
+    if (
+      !grant ||
+      grant.sessionId !== agent.session.describePersistence()?.sessionId ||
+      grant.turnId !== (turnId ?? agent.activeTurnId) ||
+      grant.turnId !== agent.activeTurnId ||
+      grant.textSha256 !== promptTextSha256(item.text)
+    )
+      return null;
+    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    if (!existing || existing.item.type !== "user_message" || existing.item.text !== item.text)
+      return null;
+    grants!.delete(clientMessageId);
+    const enriched = this.timelineStore.enrichSubmittedUserMessage(
+      agent.id,
+      clientMessageId,
+      messageId,
+    );
+    if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
+    this.persistSubmittedPromptBinding(agent, item, messageId);
     return existing;
   }
 

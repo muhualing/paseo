@@ -7,6 +7,10 @@ import { promises as fs } from "node:fs";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage } from "./agent-storage.js";
 import {
+  MAX_SUBMITTED_PROMPT_ID_LENGTH,
+  MAX_SUBMITTED_PROMPT_BINDINGS,
+  MAX_SUBMITTED_PROMPT_BINDINGS_BYTES,
+  SubmittedPromptBindingsSchema,
   promptTextSha256,
   restoreSubmittedPromptProvenance,
   type SubmittedPromptBinding,
@@ -197,6 +201,115 @@ describe("AgentStorage", () => {
       const reopened = new AgentStorage(storagePath, logger);
       expect((await reopened.get(agent.id))?.id).toBe(agent.id);
       expect(await reopened.getSubmittedPromptBindings(agent.id)).toEqual([]);
+    },
+  );
+
+  test("provenance budgets accept exact boundaries and reject one over", () => {
+    const binding: SubmittedPromptBinding = {
+      provider: "codex",
+      sessionId: "session",
+      providerMessageId: "native",
+      clientMessageId: "x".repeat(MAX_SUBMITTED_PROMPT_ID_LENGTH),
+      textSha256: promptTextSha256("same"),
+    };
+    expect(SubmittedPromptBindingsSchema.safeParse([binding]).success).toBe(true);
+    for (const field of [
+      "provider",
+      "sessionId",
+      "providerMessageId",
+      "clientMessageId",
+    ] as const) {
+      expect(
+        SubmittedPromptBindingsSchema.safeParse([
+          { ...binding, [field]: "x".repeat(MAX_SUBMITTED_PROMPT_ID_LENGTH + 1) },
+        ]).success,
+      ).toBe(false);
+    }
+    const minimal = { ...binding, clientMessageId: "x" };
+    expect(
+      SubmittedPromptBindingsSchema.safeParse(Array(MAX_SUBMITTED_PROMPT_BINDINGS).fill(minimal))
+        .success,
+    ).toBe(true);
+    expect(
+      SubmittedPromptBindingsSchema.safeParse(
+        Array(MAX_SUBMITTED_PROMPT_BINDINGS + 1).fill(minimal),
+      ).success,
+    ).toBe(false);
+    const exact = byteBudgetBindings();
+    expect(Buffer.byteLength(JSON.stringify(exact))).toBe(MAX_SUBMITTED_PROMPT_BINDINGS_BYTES);
+    expect(SubmittedPromptBindingsSchema.safeParse(exact).success).toBe(true);
+    exact[0].providerMessageId += "x";
+    expect(Buffer.byteLength(JSON.stringify(exact))).toBe(MAX_SUBMITTED_PROMPT_BINDINGS_BYTES + 1);
+    expect(SubmittedPromptBindingsSchema.safeParse(exact).success).toBe(false);
+  });
+
+  test.each(["id", "count", "bytes"])(
+    "over-budget %s records remain readable and unchanged",
+    async (budget) => {
+      const agent = createManagedAgent({ id: "over-budget" });
+      await storage.applySnapshot(agent);
+      const original = await new AgentStorage(storagePath, logger).get(agent.id);
+      if (!original) throw new Error("Missing test record");
+      const binding: SubmittedPromptBinding = {
+        provider: "codex",
+        sessionId: "session",
+        providerMessageId: "native",
+        clientMessageId: "automatic",
+        textSha256: promptTextSha256("same"),
+      };
+      let entries = byteBudgetBindings();
+      if (budget === "id")
+        entries = [{ ...binding, clientMessageId: "x".repeat(MAX_SUBMITTED_PROMPT_ID_LENGTH + 1) }];
+      if (budget === "count") entries = Array(MAX_SUBMITTED_PROMPT_BINDINGS + 1).fill(binding);
+      if (budget === "bytes") entries[0].providerMessageId += "x";
+      const record = { ...original, submittedPromptBindings: entries };
+      await storage.upsert(record);
+      await storage.recordSubmittedPromptBinding(agent.id, binding);
+      await storage.applySnapshot(agent);
+      const reopened = new AgentStorage(storagePath, logger);
+      expect(await reopened.getSubmittedPromptBindings(agent.id)).toEqual([]);
+      expect(await reopened.get(agent.id)).toEqual(JSON.parse(JSON.stringify(record)));
+      expect(
+        restoreSubmittedPromptProvenance(
+          { type: "user_message", text: "same", messageId: "native" },
+          await reopened.getSubmittedPromptBindings(agent.id),
+        ),
+      ).toEqual({ type: "user_message", text: "same", messageId: "native" });
+    },
+  );
+
+  test.each(["count", "bytes"])(
+    "appending beyond %s budget preserves all prior fields",
+    async (budget) => {
+      const agent = createManagedAgent({ id: "at-budget" });
+      await storage.applySnapshot(agent);
+      const original = await new AgentStorage(storagePath, logger).get(agent.id);
+      if (!original) throw new Error("Missing test record");
+      const binding: SubmittedPromptBinding = {
+        provider: "codex",
+        sessionId: "session",
+        providerMessageId: "new-native",
+        clientMessageId: "automatic",
+        textSha256: promptTextSha256("same"),
+      };
+      const entries =
+        budget === "count"
+          ? Array.from({ length: MAX_SUBMITTED_PROMPT_BINDINGS }, (_, i) => ({
+              ...binding,
+              providerMessageId: `native-${i}`,
+            }))
+          : byteBudgetBindings();
+      const record = { ...original, submittedPromptBindings: entries };
+      await storage.upsert(record);
+      await storage.recordSubmittedPromptBinding(agent.id, binding);
+      await storage.recordSubmittedPromptBinding(agent.id, {
+        ...binding,
+        clientMessageId: "x".repeat(MAX_SUBMITTED_PROMPT_ID_LENGTH + 1),
+      });
+      await storage.applySnapshot(agent);
+      const reopened = new AgentStorage(storagePath, logger);
+      expect(await reopened.get(agent.id)).toEqual(JSON.parse(JSON.stringify(record)));
+      expect(await reopened.getSubmittedPromptBindings(agent.id)).toEqual(entries);
     },
   );
 
@@ -658,3 +771,21 @@ test("native provenance requires a unique identity and matching text, never text
     restoreSubmittedPromptProvenance({ ...item, clientMessageId: "manual" }, [binding]),
   ).toEqual({ ...item, clientMessageId: "manual" });
 });
+
+function byteBudgetBindings(): SubmittedPromptBinding[] {
+  const entries = Array.from({ length: 1024 }, (_, i) => ({
+    provider: "codex",
+    sessionId: "session",
+    providerMessageId: `n${i}`,
+    clientMessageId: "x",
+    textSha256: promptTextSha256("same"),
+  }));
+  let remaining = MAX_SUBMITTED_PROMPT_BINDINGS_BYTES - Buffer.byteLength(JSON.stringify(entries));
+  for (const entry of entries) {
+    const added = Math.min(remaining, MAX_SUBMITTED_PROMPT_ID_LENGTH - 1);
+    entry.clientMessageId += "x".repeat(added);
+    remaining -= added;
+  }
+  if (remaining !== 0) throw new Error("Budget fixture cannot fill exact boundary");
+  return entries;
+}

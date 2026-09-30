@@ -14,7 +14,9 @@ const imports = async (name) =>
   import(pathToFileURL(path.join(serverRoot, "dist/server/server/agent", name)));
 const { AgentManager } = await imports("agent-manager.js");
 const { AgentStorage } = await imports("agent-storage.js");
-const { promptTextSha256 } = await imports("submitted-prompt-provenance.js");
+const { promptTextSha256, SubmittedPromptBindingsSchema } = await imports(
+  "submitted-prompt-provenance.js",
+);
 const packageInfo = JSON.parse(await readFile(path.join(serverRoot, "package.json")));
 assert.equal(packageInfo.version, "0.10.2");
 const logger = {
@@ -63,9 +65,38 @@ async function setTestBindings(storage, sourceId, scenario, sessionId) {
 }
 
 if (!phase) {
+  const binding = {
+    provider: "codex",
+    sessionId: "session",
+    providerMessageId: "native",
+    clientMessageId: "source",
+    textSha256: promptTextSha256("same text"),
+  };
+  assert.equal(
+    SubmittedPromptBindingsSchema.safeParse([{ ...binding, clientMessageId: "x".repeat(512) }])
+      .success,
+    true,
+  );
+  assert.equal(
+    SubmittedPromptBindingsSchema.safeParse([{ ...binding, clientMessageId: "x".repeat(513) }])
+      .success,
+    false,
+  );
+  assert.equal(SubmittedPromptBindingsSchema.safeParse(Array(2048).fill(binding)).success, true);
+  assert.equal(SubmittedPromptBindingsSchema.safeParse(Array(2049).fill(binding)).success, false);
+  assert.equal(
+    SubmittedPromptBindingsSchema.safeParse([
+      { ...binding, clientMessageId: "x".repeat(1024 * 1024) },
+    ]).success,
+    false,
+  );
+  assert.equal(SubmittedPromptBindingsSchema.safeParse(Array(50000).fill(binding)).success, false);
+  console.log("bounded provenance: ID/count/oversized input checks pass");
   const state = await mkdtemp(path.join(tmpdir(), "prompt-provenance-verification-"));
   try {
     for (const step of [
+      "unaccepted-write",
+      "unaccepted-restart",
       "write",
       "restart",
       "missing",
@@ -85,7 +116,7 @@ if (!phase) {
   }
 } else {
   const rawPath = path.join(root, "provider-history.json");
-  const raw = phase === "write" ? [] : JSON.parse(await readFile(rawPath, "utf8"));
+  const raw = phase.endsWith("write") ? [] : JSON.parse(await readFile(rawPath, "utf8"));
   const rawDigest = () => createHash("sha256").update(JSON.stringify(raw)).digest("hex");
   let originalRawHash = rawDigest();
   const sessionId = phase === "different-session" ? "other-session" : "native-session";
@@ -143,6 +174,7 @@ if (!phase) {
       return { turnId };
     }
   }
+  let fixtureSession;
   const client = {
     provider: "codex",
     capabilities,
@@ -156,10 +188,12 @@ if (!phase) {
       };
     },
     async createSession(config) {
-      return new Session(config);
+      fixtureSession = new Session(config);
+      return fixtureSession;
     },
     async resumeSession() {
-      return new Session({ provider: "codex", cwd: root });
+      fixtureSession = new Session({ provider: "codex", cwd: root });
+      return fixtureSession;
     },
   };
   const storage = new AgentStorage(path.join(root, "records"), logger);
@@ -177,7 +211,41 @@ if (!phase) {
     undefined,
   ];
   try {
-    if (phase === "write") {
+    if (phase === "unaccepted-write") {
+      await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+        workspaceId: undefined,
+      });
+      const unsolicited = {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "user_message",
+          text: "same text",
+          messageId: "native-unsolicited",
+          clientMessageId: "automatic-input",
+        },
+      };
+      for (let i = 0; i < 2; i++) {
+        fixtureSession.emit(unsolicited);
+        await manager.flush();
+        assert.equal((await storage.getSubmittedPromptBindings(id)).length, 0);
+      }
+      assert.equal(
+        manager.getTimeline(id).find((item) => item.messageId === "native-unsolicited")
+          ?.clientMessageId,
+        undefined,
+      );
+      raw.push({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "same text", messageId: "native-unsolicited" },
+      });
+      await writeFile(rawPath, JSON.stringify(raw));
+      originalRawHash = rawDigest();
+      await manager.reloadAgentSession(id, undefined, { rehydrateFromDisk: true });
+      await manager.hydrateTimelineFromProvider(id);
+      console.log("accepted sends=0; unsolicited echoes=2; bindings=0");
+    } else if (phase === "write") {
       await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
         workspaceId: undefined,
       });
@@ -237,10 +305,11 @@ if (!phase) {
         JSON.parse(await readFile(path.join(root, "epoch.json"))),
       );
     const sourceIds = manager.getTimeline(id).map((item) => item.clientMessageId);
-    assert.deepEqual(
-      sourceIds,
-      ["write", "restart"].includes(phase) ? expected : expected.map(() => undefined),
-    );
+    let expectedSources = ["write", "restart"].includes(phase)
+      ? expected
+      : expected.map(() => undefined);
+    if (phase.startsWith("unaccepted-")) expectedSources = [undefined];
+    assert.deepEqual(sourceIds, expectedSources);
     await manager.hydrateTimelineFromProvider(id, { force: true });
     assert.deepEqual(
       manager.getTimeline(id).map((item) => item.clientMessageId),
@@ -257,8 +326,12 @@ if (!phase) {
     const displayed = manager
       .getTimeline(id)
       .filter((item) => item.clientMessageId !== "automatic-input");
-    assert.equal(displayed.length, ["write", "restart"].includes(phase) ? 3 : 5);
-    console.log(`${phase}: pass; ${sourceIds.length} inputs; raw history unchanged by hydration`);
+    let expectedVisibleCount = ["write", "restart"].includes(phase) ? 3 : 5;
+    if (phase.startsWith("unaccepted-")) expectedVisibleCount = 1;
+    assert.equal(displayed.length, expectedVisibleCount);
+    console.log(
+      `${phase}: pass; ${sourceIds.length} inputs; raw history unchanged by hydration; rawSha256=${originalRawHash}`,
+    );
   } finally {
     await manager.closeAgent(id).catch(() => undefined);
     await manager.flush();
