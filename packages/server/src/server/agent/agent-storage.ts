@@ -4,6 +4,10 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
+import {
+  SubmittedPromptBindingsSchema,
+  type SubmittedPromptBinding,
+} from "./submitted-prompt-provenance.js";
 import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
@@ -43,6 +47,8 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .optional();
 
 const STORED_AGENT_SCHEMA = z.object({
+  // Validate separately so damaged optional provenance cannot make a chat unloadable.
+  submittedPromptBindings: z.unknown().optional(),
   id: z.string(),
   provider: z.string(),
   cwd: z.string(),
@@ -155,6 +161,40 @@ export class AgentStorage {
     await this.queueRecordWrite(record);
   }
 
+  async getSubmittedPromptBindings(agentId: string): Promise<SubmittedPromptBinding[]> {
+    const record = await this.get(agentId);
+    const parsed = SubmittedPromptBindingsSchema.safeParse(record?.submittedPromptBindings ?? []);
+    return parsed.success ? parsed.data : [];
+  }
+
+  async recordSubmittedPromptBinding(
+    agentId: string,
+    binding: SubmittedPromptBinding,
+  ): Promise<void> {
+    await this.load();
+    const validated = SubmittedPromptBindingsSchema.parse([binding])[0];
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error("Cannot bind a prompt without its stored session");
+      const parsed = SubmittedPromptBindingsSchema.safeParse(
+        existing.submittedPromptBindings ?? [],
+      );
+      // Preserve damaged records for inspection; never replace them with inferred provenance.
+      if (!parsed.success) return existing;
+      const bindings = parsed.data;
+      const duplicate = bindings.some(
+        (entry) =>
+          entry.provider === validated.provider &&
+          entry.sessionId === validated.sessionId &&
+          entry.providerMessageId === validated.providerMessageId &&
+          entry.clientMessageId === validated.clientMessageId &&
+          entry.textSha256 === validated.textSha256,
+      );
+      return duplicate
+        ? existing
+        : { ...existing, submittedPromptBindings: [...bindings, validated] };
+    });
+  }
+
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
     return this.queueRecordMutation(record.id, () => record);
   }
@@ -252,6 +292,9 @@ export class AgentStorage {
         createdAt: existing?.createdAt,
         internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
       });
+      if (existing?.submittedPromptBindings !== undefined) {
+        record.submittedPromptBindings = existing.submittedPromptBindings;
+      }
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a

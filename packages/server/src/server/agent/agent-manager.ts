@@ -1,4 +1,9 @@
 import { projectTimelineRows } from "./timeline-projection.js";
+import {
+  promptTextSha256,
+  restoreSubmittedPromptProvenance,
+  type SubmittedPromptBinding,
+} from "./submitted-prompt-provenance.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
@@ -2547,7 +2552,8 @@ export class AgentManager {
           messageId: options.clientMessageId,
           turnId,
           providerMessageId:
-            stagedSubmittedPromptEcho?.item.type === "user_message"
+            stagedSubmittedPromptEcho?.item.type === "user_message" &&
+            stagedSubmittedPromptEcho.item.text === submittedPromptText(prompt)
               ? stagedSubmittedPromptEcho.item.messageId
               : undefined,
         });
@@ -3685,6 +3691,7 @@ export class AgentManager {
       return { timestamp: now.toISOString() };
     }
     return {
+      rows: await this.durableTimelineStore.getCommittedRows(agentId),
       nextSeq: (await this.durableTimelineStore.getLatestCommittedSeq(agentId)) + 1,
       timestamp: now.toISOString(),
     };
@@ -3992,6 +3999,7 @@ export class AgentManager {
     broadcast: boolean,
     broadcastTimeline: boolean,
   ): Promise<void> {
+    const bindings = await this.getSubmittedPromptBindings(agent);
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     for await (const rawEvent of agent.session.streamHistory()) {
@@ -4000,7 +4008,10 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: restoreSubmittedPromptProvenance(event.item, bindings),
+        });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
       }
@@ -4048,6 +4059,7 @@ export class AgentManager {
       | AsyncIterable<AgentStreamEvent>
       | Iterable<AgentStreamEvent> = agent.session.streamHistory(),
   ): Promise<void> {
+    const bindings = await this.getSubmittedPromptBindings(agent);
     const deferredBroadcast = typeof broadcast === "function";
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const historySubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
@@ -4068,7 +4080,10 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: restoreSubmittedPromptProvenance(event.item, bindings),
+        });
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
@@ -4678,7 +4693,15 @@ export class AgentManager {
     clientMessageId: string,
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
-    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
+    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    if (existing) {
+      if (
+        options?.providerMessageId &&
+        existing.item.type === "user_message" &&
+        existing.item.text === submittedPromptText(prompt)
+      ) {
+        this.persistSubmittedPromptBinding(agent, existing.item, options.providerMessageId);
+      }
       return;
     }
     this.touchUpdatedAt(agent);
@@ -4690,6 +4713,9 @@ export class AgentManager {
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
+    if (options?.providerMessageId) {
+      this.persistSubmittedPromptBinding(agent, item, options.providerMessageId);
+    }
   }
 
   private reconcileSubmittedPromptEcho(
@@ -4700,15 +4726,16 @@ export class AgentManager {
     const { clientMessageId, messageId } = item;
     if (!clientMessageId) return null;
     let existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    const wasSubmitted = existing !== null;
     if (!existing) {
       this.recordSubmittedPrompt(agent, item.text, clientMessageId, {
         messageId: clientMessageId,
-        ...(messageId ? { providerMessageId: messageId } : {}),
         ...(turnId ? { turnId } : {}),
       });
       existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
     }
     if (!existing || existing.item.type !== "user_message") return null;
+    if (existing.item.text !== item.text) return null;
     if (messageId) {
       const enriched = this.timelineStore.enrichSubmittedUserMessage(
         agent.id,
@@ -4716,8 +4743,47 @@ export class AgentManager {
         messageId,
       );
       if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
+      if (wasSubmitted) this.persistSubmittedPromptBinding(agent, item, messageId);
     }
     return existing;
+  }
+
+  private persistSubmittedPromptBinding(
+    agent: ActiveManagedAgent,
+    item: AgentTimelineItem,
+    providerMessageId: string,
+  ): void {
+    const handle = agent.session.describePersistence();
+    if (
+      !this.registry ||
+      !handle?.sessionId ||
+      item.type !== "user_message" ||
+      !item.clientMessageId
+    )
+      return;
+    const binding: SubmittedPromptBinding = {
+      provider: agent.provider,
+      sessionId: handle.sessionId,
+      providerMessageId,
+      clientMessageId: item.clientMessageId,
+      textSha256: promptTextSha256(item.text),
+    };
+    const task = this.registry.recordSubmittedPromptBinding(agent.id, binding).catch((err) => {
+      this.logger.error({ err, agentId: agent.id }, "Failed to persist submitted prompt binding");
+    });
+    this.trackBackgroundTask(task);
+  }
+
+  private async getSubmittedPromptBindings(
+    agent: ActiveManagedAgent,
+  ): Promise<SubmittedPromptBinding[]> {
+    const handle = agent.session.describePersistence();
+    if (!handle?.sessionId) return [];
+    await this.registry?.flush();
+    const bindings = (await this.registry?.getSubmittedPromptBindings(agent.id)) ?? [];
+    return bindings.filter(
+      (binding) => binding.provider === agent.provider && binding.sessionId === handle.sessionId,
+    );
   }
 
   private async appendSystemErrorTimelineMessage(

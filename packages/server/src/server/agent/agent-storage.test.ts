@@ -6,6 +6,11 @@ import { promises as fs } from "node:fs";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage } from "./agent-storage.js";
+import {
+  promptTextSha256,
+  restoreSubmittedPromptProvenance,
+  type SubmittedPromptBinding,
+} from "./submitted-prompt-provenance.js";
 import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
@@ -147,6 +152,53 @@ describe("AgentStorage", () => {
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  test("prompt bindings serialize concurrent writes and survive snapshots and reopen", async () => {
+    const agent = createManagedAgent({ id: "bound-session" });
+    await storage.applySnapshot(agent);
+    const binding: SubmittedPromptBinding = {
+      provider: "codex",
+      sessionId: "session",
+      providerMessageId: "native",
+      clientMessageId: "automatic",
+      textSha256: promptTextSha256("same"),
+    };
+    const conflicting = { ...binding, clientMessageId: "manual" };
+    await Promise.all([
+      storage.recordSubmittedPromptBinding(agent.id, binding),
+      storage.recordSubmittedPromptBinding(agent.id, conflicting),
+      storage.applySnapshot(agent),
+    ]);
+    await storage.recordSubmittedPromptBinding(agent.id, binding);
+    const reopened = new AgentStorage(storagePath, logger);
+    expect(await reopened.getSubmittedPromptBindings(agent.id)).toEqual([binding, conflicting]);
+    expect(
+      restoreSubmittedPromptProvenance(
+        { type: "user_message", text: "same", messageId: "native" },
+        await reopened.getSubmittedPromptBindings(agent.id),
+      ),
+    ).toEqual({ type: "user_message", text: "same", messageId: "native" });
+  });
+
+  test.each([
+    undefined,
+    null,
+    "broken",
+    [{ providerMessageId: "native", clientMessageId: "automatic" }],
+  ])(
+    "missing or damaged provenance remains visible and the record stays readable: %j",
+    async (value) => {
+      const agent = createManagedAgent({ id: "damaged-session" });
+      await storage.applySnapshot(agent);
+      const record = await storage.get(agent.id);
+      if (!record) throw new Error("Missing test record");
+      await storage.upsert({ ...record, submittedPromptBindings: value });
+      await storage.applySnapshot(agent);
+      const reopened = new AgentStorage(storagePath, logger);
+      expect((await reopened.get(agent.id))?.id).toBe(agent.id);
+      expect(await reopened.getSubmittedPromptBindings(agent.id)).toEqual([]);
+    },
+  );
 
   test("applySnapshot persists configs and snapshot metadata", async () => {
     await storage.applySnapshot(
@@ -575,4 +627,34 @@ describe("AgentStorage", () => {
     const after = await afterReload.list();
     expect(after.some((r) => r.id === agentId)).toBe(false);
   });
+});
+
+test("native provenance requires a unique identity and matching text, never text alone", () => {
+  const item = { type: "user_message", text: "same", messageId: "native" } as const;
+  const binding: SubmittedPromptBinding = {
+    provider: "codex",
+    sessionId: "session",
+    providerMessageId: "native",
+    clientMessageId: "automatic",
+    textSha256: promptTextSha256("same"),
+  };
+  expect(restoreSubmittedPromptProvenance(item, [binding])).toEqual({
+    ...item,
+    clientMessageId: "automatic",
+  });
+  expect(restoreSubmittedPromptProvenance(item, [])).toEqual(item);
+  expect(
+    restoreSubmittedPromptProvenance(item, [{ ...binding, providerMessageId: "other-native" }]),
+  ).toEqual(item);
+  expect(
+    restoreSubmittedPromptProvenance(item, [
+      { ...binding, textSha256: promptTextSha256("changed") },
+    ]),
+  ).toEqual(item);
+  expect(
+    restoreSubmittedPromptProvenance(item, [binding, { ...binding, clientMessageId: "manual" }]),
+  ).toEqual(item);
+  expect(
+    restoreSubmittedPromptProvenance({ ...item, clientMessageId: "manual" }, [binding]),
+  ).toEqual({ ...item, clientMessageId: "manual" });
 });
