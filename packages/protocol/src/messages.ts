@@ -658,15 +658,17 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
     ToolCallCanceledPayloadSchema,
   ]);
 
+export const UserMessageTimelineItemPayloadSchema = z.object({
+  type: z.literal("user_message"),
+  text: z.string(),
+  messageId: z.string().optional(),
+  clientMessageId: z.string().optional(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
-  z.object({
-    type: z.literal("user_message"),
-    text: z.string(),
-    messageId: z.string().optional(),
-    clientMessageId: z.string().optional(),
-  }),
+  UserMessageTimelineItemPayloadSchema,
   z.object({
     type: z.literal("assistant_message"),
     text: z.string(),
@@ -1864,6 +1866,8 @@ export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.list_prompts.request"),
   agentId: z.string(),
   requestId: z.string(),
+  includeItems: z.boolean().optional(),
+  cursor: z.number().int().nonnegative().optional(),
 });
 
 export const ProviderSubagentListRequestMessageSchema = z.object({
@@ -3617,6 +3621,7 @@ export const ServerInfoStatusPayloadSchema = z
         rewind: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: z.boolean().optional(),
+        agentTimelinePromptDisplayItems: z.boolean().optional(),
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.
         agentHistorySearch: z.boolean().optional(),
         // COMPAT(checkoutRefresh): added in v0.1.86, remove gate after 2026-11-29.
@@ -4648,8 +4653,10 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         seq: z.number().int().nonnegative(),
         timestamp: z.string(),
         preview: z.string(),
+        item: UserMessageTimelineItemPayloadSchema.optional(),
       }),
     ),
+    nextCursor: z.number().int().nonnegative().nullable().optional(),
     error: z.string().nullable(),
   }),
 });

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import {
+  AgentTimelineListPromptsRequestMessageSchema,
+  AgentTimelineListPromptsResponseMessageSchema,
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
@@ -388,4 +390,63 @@ test("blocked setup preserves the legacy failed shape and optional provenance", 
   expect(WorkspaceSetupSnapshotSchema.parse(legacySnapshot.parse(failed))).toEqual(
     legacySnapshot.parse(failed),
   );
+});
+
+test("prompt display sources are opt-in and optional in both wire directions", () => {
+  const request = {
+    type: "agent.timeline.list_prompts.request",
+    agentId: "conversation",
+    requestId: "request",
+  };
+  expect(AgentTimelineListPromptsRequestMessageSchema.parse(request)).toEqual(request);
+  expect(
+    AgentTimelineListPromptsRequestMessageSchema.parse({
+      ...request,
+      includeItems: true,
+      cursor: 9,
+    }),
+  ).toMatchObject({ includeItems: true, cursor: 9 });
+  const response = {
+    type: "agent.timeline.list_prompts.response",
+    payload: {
+      requestId: "request",
+      agentId: "conversation",
+      epoch: "epoch",
+      prompts: [{ seq: 10, timestamp: "now", preview: "short" }],
+      error: null,
+    },
+  };
+  expect(AgentTimelineListPromptsResponseMessageSchema.parse(response)).toEqual(response);
+  const legacy = z.object({
+    type: z.literal("agent.timeline.list_prompts.response"),
+    payload: z.object({
+      requestId: z.string(),
+      agentId: z.string(),
+      epoch: z.string(),
+      prompts: z.array(z.object({ seq: z.number(), timestamp: z.string(), preview: z.string() })),
+      error: z.string().nullable(),
+    }),
+  });
+  const modern = {
+    ...response,
+    payload: {
+      ...response.payload,
+      nextCursor: null,
+      prompts: [
+        {
+          ...response.payload.prompts[0],
+          item: {
+            type: "user_message",
+            text: "complete body",
+            messageId: "native",
+            clientMessageId: "ordinary",
+          },
+        },
+      ],
+    },
+  };
+  expect(legacy.parse(modern)).toEqual(response);
+  expect(
+    AgentTimelineListPromptsResponseMessageSchema.parse(modern).payload.prompts[0].item,
+  ).toEqual(modern.payload.prompts[0].item);
 });

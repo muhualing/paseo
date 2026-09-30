@@ -1669,6 +1669,50 @@ test("lists the full agent prompt index", async () => {
     epoch: "epoch-1",
     prompts: [{ seq: 1, preview: "First prompt" }],
   });
+
+  const sources = client.listAgentTimelinePrompts("agent-1", {
+    requestId: "req-sources",
+    includeItems: true,
+    cursor: 1,
+  });
+  expect(parseSentFrame(mock.sent.at(-1)!)).toEqual({
+    type: "agent.timeline.list_prompts.request",
+    requestId: "req-sources",
+    agentId: "agent-1",
+    includeItems: true,
+    cursor: 1,
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.timeline.list_prompts.response",
+      payload: {
+        requestId: "req-sources",
+        agentId: "agent-1",
+        epoch: "epoch-1",
+        prompts: [
+          {
+            seq: 2,
+            timestamp: "now",
+            preview: "short",
+            item: {
+              type: "user_message",
+              text: "complete body",
+              messageId: "native",
+              clientMessageId: "ordinary",
+            },
+          },
+        ],
+        nextCursor: null,
+        error: null,
+      },
+    }),
+  );
+  await expect(sources).resolves.toMatchObject({
+    nextCursor: null,
+    prompts: [
+      { item: { messageId: "native", clientMessageId: "ordinary", text: "complete body" } },
+    ],
+  });
 });
 
 test("honors explicit fetchAgents timeout below the session RPC default", async () => {

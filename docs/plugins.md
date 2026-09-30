@@ -433,6 +433,24 @@ its Zod schema, and mounts the component inside the normal plugin runtime and er
 optional output `id` distinguishes several stable replacements from the same source item; its output
 index is the default.
 
+Trusted client contributions remain installed during a transport interruption. Removing a host,
+changing its client identity, rejecting credentials, revoking catalog access, or receiving a catalog
+without a contribution ends that trust scope. Offline retention is in memory; refreshed pages wait
+for the catalog before painting canonical history. Setup RPCs started through `client.rpc` also hold
+canonical user history until their continuations finish registering source-dependent rules. Start
+those reads during contribution setup; timer-delayed initialization has no readiness contract.
+Optimistic input remains available, and installed assistant rules can continue presenting progress.
+
+The chat outline applies the same user-message transformers to complete source items. Preview text
+cannot establish origin or verify a body hash. Hosts with `agentTimelinePromptDisplayItems` support
+opt-in source pages through `agent.timeline.list_prompts.request`; legacy requests retain their
+preview-only response. Source pages contain only the existing user-message fields, at most 50
+entries and 256 KiB of body data, with a 64 KiB limit per item. Oversized or unverified items have no
+outline entry while a user-message display policy applies. Hosts without the capability keep their
+ordinary outline when no such policy is active; they need the new contract to show a filtered outline.
+Live refreshes request only prompts after the cached cursor. Source bodies are never persisted by
+the outline, and assistant history, attachments, or extra metadata are not part of this projection.
+
 Transformers run synchronously and must be deterministic. When several transformers match, the
 first one that returns a result owns that source item. Plugin and registration ordering is stable.
 See `plugin-examples/timeline-items` for the complete contract.

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { AgentTimelinePromptIndexPayload } from "@getpaseo/client/internal/daemon-client";
+import type { TimelineItemTransform } from "@/plugins/timeline/model";
 import { isWeb } from "@/constants/platform";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -34,6 +35,8 @@ export interface UseChatOutlineInput {
   viewportRef: RefObject<StreamViewportHandle | null>;
   onJumpError: () => void;
   visibleMessageIds?: ReadonlySet<string>;
+  transformTimelineItem?: TimelineItemTransform;
+  requiresSourceItems?: boolean;
   revealLoadedMessage?: (messageId: string) => boolean;
 }
 
@@ -55,15 +58,38 @@ export function useChatOutline({
   onJumpError,
   visibleMessageIds,
   revealLoadedMessage,
+  transformTimelineItem,
+  requiresSourceItems = transformTimelineItem !== undefined,
 }: UseChatOutlineInput): ChatOutline {
   const [index, setIndex] = useState<AgentTimelinePromptIndexPayload | null>(null);
+  const sourceIndexRef = useRef<{
+    agentId: string;
+    serverId: string;
+    payload: AgentTimelinePromptIndexPayload;
+    includeItems: boolean;
+  } | null>(null);
+  const includeItems = requiresSourceItems;
   const [pendingJump, setPendingJump] = useState<PendingPromptJump | null>(null);
   const [activePrompt] = useState(createActivePromptPublisher);
   const readingSeqRef = useRef<number | null>(null);
   const nextJumpRequestIdRef = useRef(0);
   const nextIndexRequestIdRef = useRef(0);
   const loadedItems = useMemo(() => [...tail, ...(head ?? NO_STREAM_ITEMS)], [head, tail]);
-  const prompts = enabled ? (index?.prompts ?? NO_PROMPTS) : NO_PROMPTS;
+  const prompts = useMemo(() => {
+    if (!enabled || !index) return NO_PROMPTS;
+    if (!requiresSourceItems || !transformTimelineItem) return index.prompts;
+    return index.prompts.filter((prompt) => {
+      // A preview cannot establish provenance or match a complete-body hash.
+      if (!prompt.item) return false;
+      return (
+        transformTimelineItem({
+          item: Object.freeze({ ...prompt.item }),
+          phase: "complete",
+          sourceId: prompt.item.messageId ?? `prompt/${index.epoch}/${prompt.seq}`,
+        }) === undefined
+      );
+    });
+  }, [enabled, index, requiresSourceItems, transformTimelineItem]);
 
   // The viewed timeline already owns live delivery and reconnect catch-up. Its complete
   // loaded items (including rows outside the mounted window) invalidate the prompt index.
@@ -89,14 +115,51 @@ export function useChatOutline({
     let active = true;
     const refresh = () => {
       const requestId = ++nextIndexRequestIdRef.current;
-      void client
-        .listAgentTimelinePrompts(agentId)
+      void (async () => {
+        const cached = sourceIndexRef.current;
+        const previous =
+          includeItems &&
+          cached?.includeItems === includeItems &&
+          cached.agentId === agentId &&
+          cached.serverId === serverId &&
+          cached.payload.epoch === timelineEpoch
+            ? cached.payload
+            : null;
+        const after = previous?.prompts.at(-1)?.seq;
+        const first = await (includeItems
+          ? client.listAgentTimelinePrompts(agentId, { includeItems: true, cursor: after })
+          : client.listAgentTimelinePrompts(agentId));
+        const pagePrompts =
+          previous && first.epoch === previous.epoch
+            ? [...previous.prompts, ...first.prompts]
+            : [...first.prompts];
+        let cursor = first.nextCursor;
+        while (cursor !== undefined && cursor !== null) {
+          if (!active || requestId !== nextIndexRequestIdRef.current) return null;
+          const page = await client.listAgentTimelinePrompts(agentId, {
+            includeItems: true,
+            cursor,
+          });
+          if (page.epoch !== first.epoch) return null;
+          pagePrompts.push(...page.prompts);
+          if (
+            page.nextCursor !== undefined &&
+            page.nextCursor !== null &&
+            page.nextCursor <= cursor
+          )
+            return null;
+          cursor = page.nextCursor;
+        }
+        return { ...first, prompts: pagePrompts };
+      })()
         .then((payload) => {
           if (
+            payload &&
             active &&
             requestId === nextIndexRequestIdRef.current &&
             shouldAcceptPromptIndexEpoch(timelineEpoch, payload.epoch)
           ) {
+            sourceIndexRef.current = { agentId, serverId, payload, includeItems };
             setIndex(payload);
           }
           return undefined;
@@ -107,7 +170,7 @@ export function useChatOutline({
     return () => {
       active = false;
     };
-  }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq]);
+  }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq, includeItems]);
 
   // The transcript resolves display rows (including Markdown blocks and plugin cards) to
   // timeline positions. The outline uses the complete index, including unloaded prompts.

@@ -4,6 +4,7 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 
 import {
+  toDaemonServerInfo,
   normalizeWorkspaceDescriptor,
   selectAgentTurnPresentation,
   selectAgentTimelineState,
@@ -799,4 +800,28 @@ describe("removeWorkspace", () => {
     expect(after.session).toBe(before.session);
     expect(after.workspaces).toBe(before.workspaces);
   });
+});
+
+it("retains advertised catalog permissions so a reconnect can revoke a display trust scope", () => {
+  expect(
+    toDaemonServerInfo({
+      status: "server_info",
+      serverId: "host",
+      hostname: null,
+      version: null,
+      permissions: ["daemon.manage"],
+    }).permissions,
+  ).toEqual(["daemon.manage"]);
+  expect(
+    toDaemonServerInfo({
+      status: "server_info",
+      serverId: "host",
+      hostname: null,
+      version: null,
+      permissions: [],
+    }).permissions,
+  ).toEqual([]);
+  expect(
+    toDaemonServerInfo({ status: "server_info", serverId: "host", hostname: null, version: null }),
+  ).not.toHaveProperty("permissions");
 });

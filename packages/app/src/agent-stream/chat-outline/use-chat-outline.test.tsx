@@ -30,13 +30,13 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-describe("useChatOutline", () => {
-  beforeEach(() => {
-    runtime.listAgentTimelinePrompts.mockReset();
-    runtime.fetchAgentTimeline.mockReset();
-    runtime.subscribeAgentTimeline.mockClear();
-  });
+beforeEach(() => {
+  runtime.listAgentTimelinePrompts.mockReset();
+  runtime.fetchAgentTimeline.mockReset();
+  runtime.subscribeAgentTimeline.mockClear();
+});
 
+describe("useChatOutline", () => {
   it("waits for a served timeline before requesting its prompt index", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({ epoch: "epoch-1", prompts: [] });
     const viewportRef = createRef<StreamViewportHandle>();
@@ -401,4 +401,128 @@ describe("useChatOutline", () => {
     await act(async () => result.current.jumpToPrompt(2));
     expect(scrollToMessage).toHaveBeenCalledWith("live-prompt");
   });
+});
+
+it("applies the transcript display policy to complete source items, never preview text", async () => {
+  const hidden = {
+    type: "user_message",
+    text: "automatic input",
+    messageId: "trusted",
+    clientMessageId: "scheduled:1",
+  };
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-1",
+    nextCursor: null,
+    prompts: [
+      { seq: 1, timestamp: "2026-01-01", preview: "automatic input", item: hidden },
+      {
+        seq: 2,
+        timestamp: "2026-01-01",
+        preview: "automatic input",
+        item: { ...hidden, messageId: "paste", clientMessageId: "ordinary:1" },
+      },
+      { seq: 3, timestamp: "2026-01-01", preview: "automatic input" },
+    ],
+  });
+  const transform = vi.fn(({ item }) => (item.clientMessageId === "scheduled:1" ? [] : undefined));
+  const { result, rerender } = renderHook(
+    ({ policy }) =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch-1",
+        tail: [],
+        head: [],
+        enabled: true,
+        viewportRef: createRef<StreamViewportHandle>(),
+        onJumpError: vi.fn(),
+        transformTimelineItem: policy,
+      }),
+    { initialProps: { policy: transform } },
+  );
+  await waitFor(() => expect(runtime.listAgentTimelinePrompts).toHaveBeenCalled());
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([2]));
+  expect(transform).toHaveBeenCalledWith(
+    expect.objectContaining({ item: hidden, phase: "complete" }),
+  );
+  rerender({ policy: vi.fn(() => undefined) });
+  expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2]);
+});
+
+it("paginates source bodies once and reuses them when the display policy changes", async () => {
+  const prompt = (seq: number) => ({
+    seq,
+    timestamp: "now",
+    preview: "short",
+    item: { type: "user_message" as const, text: "complete text", messageId: `message-${seq}` },
+  });
+  runtime.listAgentTimelinePrompts
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(1)], nextCursor: 1 })
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(2)], nextCursor: null })
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(3)], nextCursor: null });
+  const initialPolicy = vi.fn(() => undefined);
+  const props = { policy: initialPolicy, tail: [] as import("@/types/stream").StreamItem[] };
+  const { result, rerender } = renderHook(
+    ({ policy, tail }) =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch-1",
+        tail,
+        head: [],
+        enabled: true,
+        viewportRef: createRef<StreamViewportHandle>(),
+        onJumpError: vi.fn(),
+        transformTimelineItem: policy,
+      }),
+    { initialProps: props },
+  );
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2]));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenNthCalledWith(2, "agent-1", {
+    includeItems: true,
+    cursor: 1,
+  });
+  rerender({ ...props, policy: vi.fn(() => undefined) });
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(2);
+  rerender({
+    ...props,
+    tail: [
+      {
+        kind: "user_message",
+        id: "message-3",
+        messageId: "message-3",
+        text: "complete text",
+        timestamp: new Date(),
+        timelineCursor: { epoch: "epoch-1", seq: 3 },
+      },
+    ],
+  });
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2, 3]));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenNthCalledWith(3, "agent-1", {
+    includeItems: true,
+    cursor: 2,
+  });
+});
+
+it("keeps ordinary preview navigation without transferring bodies when the display policy is explicitly absent", async () => {
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-1",
+    prompts: [{ seq: 1, timestamp: "now", preview: "ordinary large message" }],
+  });
+  const { result } = renderHook(() =>
+    useChatOutline({
+      agentId: "agent-1",
+      serverId: "server-1",
+      timelineEpoch: "epoch-1",
+      tail: [],
+      head: [],
+      enabled: true,
+      viewportRef: createRef<StreamViewportHandle>(),
+      onJumpError: vi.fn(),
+      transformTimelineItem: () => undefined,
+      requiresSourceItems: false,
+    }),
+  );
+  await waitFor(() => expect(result.current.prompts).toHaveLength(1));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledWith("agent-1");
 });

@@ -98,6 +98,7 @@ function transformSourceItem(
     item: cloneAndFreeze(source),
     phase,
     sourceId: item.id,
+    canonical: item.timelineCursor !== undefined,
   });
   if (transformed === undefined) return [item];
   return transformed.map((pluginItem) => {
