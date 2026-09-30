@@ -14,9 +14,9 @@ const imports = async (name) =>
   import(pathToFileURL(path.join(serverRoot, "dist/server/server/agent", name)));
 const { AgentManager } = await imports("agent-manager.js");
 const { AgentStorage } = await imports("agent-storage.js");
-const { promptTextSha256, SubmittedPromptBindingsSchema } = await imports(
-  "submitted-prompt-provenance.js",
-);
+const { threadItemToTimeline } = await imports("providers/codex-app-server-agent.js");
+const { promptTextSha256, SubmittedPromptBindingsSchema, restoreSubmittedPromptProvenance } =
+  await imports("submitted-prompt-provenance.js");
 const packageInfo = JSON.parse(await readFile(path.join(serverRoot, "package.json")));
 assert.equal(packageInfo.version, "0.10.2");
 const logger = {
@@ -61,6 +61,17 @@ async function setTestBindings(storage, sourceId, scenario, sessionId) {
         textSha256: promptTextSha256("same text"),
       },
     ];
+  if (scenario === "wrong-hash" || scenario === "wrong-provider") {
+    record.submittedPromptBindings = [
+      {
+        provider: scenario === "wrong-provider" ? "claude" : "codex",
+        sessionId,
+        providerMessageId: "native-message-1",
+        clientMessageId: "automatic-input",
+        textSha256: promptTextSha256(scenario === "wrong-hash" ? "other text" : "same text"),
+      },
+    ];
+  }
   await storage.upsert(record);
 }
 
@@ -92,6 +103,67 @@ if (!phase) {
   );
   assert.equal(SubmittedPromptBindingsSchema.safeParse(Array(50000).fill(binding)).success, false);
   console.log("bounded provenance: ID/count/oversized input checks pass");
+  const scope = { provider: "codex", sessionId: "native-session" };
+  for (const opcode of ["clientId", "client_id", "clientUserMessageId"]) {
+    for (const claimedSource of ["automatic-input", "ordinary-input", "progress-input"]) {
+      const item = threadItemToTimeline({
+        type: "userMessage",
+        id: "native",
+        [opcode]: claimedSource,
+        content: [{ type: "text", text: "same text" }],
+      });
+      const original = structuredClone(item);
+      assert.equal(restoreSubmittedPromptProvenance(item, [], scope).clientMessageId, undefined);
+      for (const acceptedSource of ["automatic-input", "ordinary-input", "progress-input"]) {
+        const trusted = {
+          ...binding,
+          ...scope,
+          providerMessageId: "native",
+          clientMessageId: acceptedSource,
+        };
+        assert.equal(
+          restoreSubmittedPromptProvenance(item, [trusted], scope).clientMessageId,
+          acceptedSource,
+        );
+        assert.equal(
+          restoreSubmittedPromptProvenance(
+            item,
+            [{ ...trusted, sessionId: "other-session" }],
+            scope,
+          ).clientMessageId,
+          undefined,
+        );
+        assert.equal(
+          restoreSubmittedPromptProvenance(item, [{ ...trusted, provider: "claude" }], scope)
+            .clientMessageId,
+          undefined,
+        );
+        assert.equal(
+          restoreSubmittedPromptProvenance(
+            item,
+            [{ ...trusted, textSha256: promptTextSha256("other") }],
+            scope,
+          ).clientMessageId,
+          undefined,
+        );
+        assert.equal(
+          restoreSubmittedPromptProvenance(
+            item,
+            [trusted, { ...trusted, clientMessageId: "conflict" }],
+            scope,
+          ).clientMessageId,
+          undefined,
+        );
+      }
+      assert.deepEqual(item, original);
+      assert.equal(
+        restoreSubmittedPromptProvenance({ ...item, messageId: undefined }, [binding], scope)
+          .clientMessageId,
+        undefined,
+      );
+    }
+  }
+  console.log("native opcode/source/scope matrix: pass; raw mapped items unchanged");
   const state = await mkdtemp(path.join(tmpdir(), "prompt-provenance-verification-"));
   try {
     for (const step of [
@@ -102,6 +174,8 @@ if (!phase) {
       "missing",
       "damaged",
       "ambiguous",
+      "wrong-hash",
+      "wrong-provider",
       "different-session",
       "corrupt-json",
     ]) {
@@ -159,7 +233,13 @@ if (!phase) {
       const index = ++turns;
       const turnId = `native-turn-${index}`;
       const messageId = `native-message-${index}`;
-      const item = { type: "user_message", text: prompt, messageId };
+      const opcode = ["clientId", "client_id", "clientUserMessageId"][(index - 1) % 3];
+      const item = threadItemToTimeline({
+        type: "userMessage",
+        id: messageId,
+        [opcode]: "automatic-input",
+        content: [{ type: "text", text: prompt }],
+      });
       raw.push({ type: "timeline", provider: "codex", item });
       setTimeout(() => {
         this.emit({ type: "turn_started", provider: "codex", turnId });
@@ -238,7 +318,12 @@ if (!phase) {
       raw.push({
         type: "timeline",
         provider: "codex",
-        item: { type: "user_message", text: "same text", messageId: "native-unsolicited" },
+        item: threadItemToTimeline({
+          type: "userMessage",
+          id: "native-unsolicited",
+          clientUserMessageId: "automatic-input",
+          content: [{ type: "text", text: "same text" }],
+        }),
       });
       await writeFile(rawPath, JSON.stringify(raw));
       originalRawHash = rawDigest();
@@ -254,7 +339,12 @@ if (!phase) {
       raw.push({
         type: "timeline",
         provider: "codex",
-        item: { type: "user_message", text: "same text", messageId: "native-unsubmitted" },
+        item: threadItemToTimeline({
+          type: "userMessage",
+          id: "native-unsubmitted",
+          client_id: "automatic-input",
+          content: [{ type: "text", text: "same text" }],
+        }),
       });
       await writeFile(rawPath, JSON.stringify(raw));
       originalRawHash = rawDigest();
@@ -275,7 +365,7 @@ if (!phase) {
         assert.equal(typeof recordPath, "string");
         await writeFile(path.join(root, "records", recordPath), "{");
       }
-      if (["missing", "damaged", "ambiguous"].includes(phase)) {
+      if (["missing", "damaged", "ambiguous", "wrong-hash", "wrong-provider"].includes(phase)) {
         await setTestBindings(storage, id, phase, sessionId);
       }
       // Restore complete bindings after the missing/damaged cases so ambiguity and session scope are independent.

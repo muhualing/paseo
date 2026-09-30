@@ -180,6 +180,7 @@ describe("AgentStorage", () => {
       restoreSubmittedPromptProvenance(
         { type: "user_message", text: "same", messageId: "native" },
         await reopened.getSubmittedPromptBindings(agent.id),
+        { provider: "codex", sessionId: "session" },
       ),
     ).toEqual({ type: "user_message", text: "same", messageId: "native" });
   });
@@ -273,6 +274,7 @@ describe("AgentStorage", () => {
         restoreSubmittedPromptProvenance(
           { type: "user_message", text: "same", messageId: "native" },
           await reopened.getSubmittedPromptBindings(agent.id),
+          { provider: "codex", sessionId: "session" },
         ),
       ).toEqual({ type: "user_message", text: "same", messageId: "native" });
     },
@@ -751,25 +753,40 @@ test("native provenance requires a unique identity and matching text, never text
     clientMessageId: "automatic",
     textSha256: promptTextSha256("same"),
   };
-  expect(restoreSubmittedPromptProvenance(item, [binding])).toEqual({
+  expect(
+    restoreSubmittedPromptProvenance(item, [binding], { provider: "codex", sessionId: "session" }),
+  ).toEqual({
     ...item,
     clientMessageId: "automatic",
   });
-  expect(restoreSubmittedPromptProvenance(item, [])).toEqual(item);
   expect(
-    restoreSubmittedPromptProvenance(item, [{ ...binding, providerMessageId: "other-native" }]),
+    restoreSubmittedPromptProvenance(item, [], { provider: "codex", sessionId: "session" }),
   ).toEqual(item);
   expect(
-    restoreSubmittedPromptProvenance(item, [
-      { ...binding, textSha256: promptTextSha256("changed") },
-    ]),
+    restoreSubmittedPromptProvenance(item, [{ ...binding, providerMessageId: "other-native" }], {
+      provider: "codex",
+      sessionId: "session",
+    }),
   ).toEqual(item);
   expect(
-    restoreSubmittedPromptProvenance(item, [binding, { ...binding, clientMessageId: "manual" }]),
+    restoreSubmittedPromptProvenance(
+      item,
+      [{ ...binding, textSha256: promptTextSha256("changed") }],
+      { provider: "codex", sessionId: "session" },
+    ),
   ).toEqual(item);
   expect(
-    restoreSubmittedPromptProvenance({ ...item, clientMessageId: "manual" }, [binding]),
-  ).toEqual({ ...item, clientMessageId: "manual" });
+    restoreSubmittedPromptProvenance(item, [binding, { ...binding, clientMessageId: "manual" }], {
+      provider: "codex",
+      sessionId: "session",
+    }),
+  ).toEqual(item);
+  expect(
+    restoreSubmittedPromptProvenance({ ...item, clientMessageId: "manual" }, [binding], {
+      provider: "codex",
+      sessionId: "session",
+    }),
+  ).toEqual({ ...item, clientMessageId: "automatic" });
 });
 
 function byteBudgetBindings(): SubmittedPromptBinding[] {

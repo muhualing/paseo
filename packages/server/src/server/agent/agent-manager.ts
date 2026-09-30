@@ -5,6 +5,7 @@ import {
   promptTextSha256,
   restoreSubmittedPromptProvenance,
   type SubmittedPromptBinding,
+  type SubmittedPromptScope,
 } from "./submitted-prompt-provenance.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -4027,7 +4028,11 @@ export class AgentManager {
         }
         historyEvents.push({
           ...event,
-          item: restoreSubmittedPromptProvenance(event.item, bindings),
+          item: restoreSubmittedPromptProvenance(
+            event.item,
+            bindings,
+            this.getSubmittedPromptScope(agent),
+          ),
         });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
@@ -4099,7 +4104,11 @@ export class AgentManager {
         }
         historyEvents.push({
           ...event,
-          item: restoreSubmittedPromptProvenance(event.item, bindings),
+          item: restoreSubmittedPromptProvenance(
+            event.item,
+            bindings,
+            this.getSubmittedPromptScope(agent),
+          ),
         });
       }
     } catch (error) {
@@ -4450,15 +4459,13 @@ export class AgentManager {
       return;
     }
 
-    if (event.item.type === "user_message" && event.item.clientMessageId) {
-      // Untrusted echoes may carry a client ID. Restore only a durable native binding,
-      // and clone the projection so provider history remains unchanged.
-      const { clientMessageId: _untrusted, ...nativeItem } = event.item;
+    if (event.item.type === "user_message") {
       event = {
         ...event,
         item: restoreSubmittedPromptProvenance(
-          nativeItem,
+          event.item,
           await this.getSubmittedPromptBindings(agent),
+          this.getSubmittedPromptScope(agent),
         ),
       };
     }
@@ -4833,6 +4840,12 @@ export class AgentManager {
       this.logger.error({ err, agentId: agent.id }, "Failed to persist submitted prompt binding");
     });
     this.trackBackgroundTask(task);
+  }
+
+  private getSubmittedPromptScope(agent: ActiveManagedAgent): SubmittedPromptScope | undefined {
+    const sessionId = agent.session.describePersistence()?.sessionId;
+    if (!sessionId) return undefined;
+    return { provider: agent.provider, sessionId };
   }
 
   private async getSubmittedPromptBindings(

@@ -54,17 +54,30 @@ export function promptTextSha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+export type SubmittedPromptScope = Pick<SubmittedPromptBinding, "provider" | "sessionId">;
+
 export function restoreSubmittedPromptProvenance(
   item: AgentTimelineItem,
   bindings: readonly SubmittedPromptBinding[],
+  scope?: SubmittedPromptScope,
 ): AgentTimelineItem {
-  if (item.type !== "user_message" || !item.messageId || item.clientMessageId) return item;
-  const matches = bindings.filter((binding) => binding.providerMessageId === item.messageId);
+  if (item.type !== "user_message") return item;
+  // Native metadata is not admission evidence. Clone before validating so every
+  // reconstruction path fails open without changing the original provider event.
+  const { clientMessageId: _untrusted, ...nativeItem } = item;
+  if (!nativeItem.messageId || !scope?.provider || !scope.sessionId) return nativeItem;
+  const matches = bindings.filter(
+    (binding) =>
+      binding.provider === scope.provider &&
+      binding.sessionId === scope.sessionId &&
+      binding.providerMessageId === nativeItem.messageId,
+  );
+
   const identities = new Set(matches.map((binding) => binding.clientMessageId));
   const textSha256 = promptTextSha256(item.text);
   // A native identity is necessary. Text only validates it; it never selects a source.
   if (identities.size !== 1 || matches.some((binding) => binding.textSha256 !== textSha256)) {
-    return item;
+    return nativeItem;
   }
-  return { ...item, clientMessageId: matches[0].clientMessageId };
+  return { ...nativeItem, clientMessageId: matches[0].clientMessageId };
 }
