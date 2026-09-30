@@ -433,6 +433,57 @@ its Zod schema, and mounts the component inside the normal plugin runtime and er
 optional output `id` distinguishes several stable replacements from the same source item; its output
 index is the default.
 
+Trusted client contributions remain installed during a transport interruption. Removing a host,
+changing its client identity, rejecting credentials, revoking catalog access, or receiving a catalog
+without a contribution ends that trust scope. Offline retention is in memory; refreshed pages wait
+for the catalog before painting canonical history. Setup RPCs started through `client.rpc` also hold
+canonical user history until their continuations finish registering source-dependent rules. Start
+those reads during contribution setup; timer-delayed initialization has no readiness contract.
+Optimistic input remains available, and installed assistant rules can continue presenting progress.
+
+The chat outline applies the same user-message transformers to complete source items. Preview text
+cannot establish origin or verify a body hash. Hosts with `agentTimelinePromptDisplayItems` support
+opt-in source pages through `agent.timeline.list_prompts.request`; legacy requests retain their
+preview-only response. Source pages contain only the existing user-message fields, at most 50
+entries and 256 KiB of body data, with a 64 KiB limit per item. When a source body is omitted,
+the outline reuses a loaded canonical row at that epoch and sequence, or reads exactly that row
+through the existing timeline API. Full text and IDs go through the same transformer; previews and
+truncated text never establish provenance. Failed source reads expose a retry control. Hosts without the capability keep their
+ordinary outline when no such policy is active; they need the new contract to show a filtered outline.
+Live refreshes request only prompts after the cached cursor. Source bodies are never persisted by
+the outline, and assistant history, attachments, or extra metadata are not part of this projection.
+
+For an installed 0.10.2 host, `scripts/patch-quiet-display-0.10.2.py` adds this runtime contract
+without replacing the package. It verifies the version, resolved protocol dependency, and full
+SHA256 of each target against `scripts/quiet-display-0.10.2.json` before writing. Unknown code is
+rejected. Run it against an offline installation with a backup directory outside the package roots:
+
+```sh
+python3 scripts/patch-quiet-display-0.10.2.py \
+  --server-root "$SERVER_PACKAGE_ROOT" --protocol-root "$PROTOCOL_PACKAGE_ROOT" \
+  --backup-dir "$PATCH_BACKUP_DIR"
+node scripts/verify-quiet-display-0.10.2.mjs "$SERVER_PACKAGE_ROOT" "$PROTOCOL_PACKAGE_ROOT"
+```
+
+Repeating the patch is safe. Use the same arguments with `--check` to verify installation, or
+`--rollback` to restore the original target files. Backups are fingerprint-checked; subsequent
+unknown edits prevent rollback. File replacement is atomic, and write failures restore prior
+targets. Keep the installation offline during all five replacements; after process interruption,
+repeat application or rollback before starting it. All other package files, local provider patches,
+plugin configuration, and plugin profile-loading code remain untouched. Update browser static
+assets only after the server contract is active; retain the previous static directory for rollback.
+The runtime patch does not update TypeScript declarations or restart a service.
+
+Fallback source reads are serial and view-scoped. They fetch one projected row per missing source
+without loading adjacent history into the transcript, and cache only user text and existing IDs in
+memory. Ordinary oversized inputs retain navigation when the transformer allows them. Removing
+the policy restores preview-only navigation without source reads. A host without the new source
+capability still needs the compatibility patch before a filtered outline is enabled.
+
+An authenticated `workspace.read` session can show ordinary history without `daemon.manage`.
+Losing catalog management removes prior plugin contributions; it does not grant catalog access.
+Rejected credentials and removed hosts continue to clear the display trust scope.
+
 Transformers run synchronously and must be deterministic. When several transformers match, the
 first one that returns a result owns that source item. Plugin and registration ordering is stable.
 See `plugin-examples/timeline-items` for the complete contract.

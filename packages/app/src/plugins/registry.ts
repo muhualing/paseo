@@ -12,6 +12,10 @@ type CatalogPlugin = Awaited<ReturnType<DaemonClient["getPluginCatalog"]>>[numbe
 export class PluginRegistry {
   private readonly byHost = new Map<string, InstalledPlugin[]>();
   private readonly listeners = new Set<() => void>();
+  private readonly displayReady = new Set<string>();
+  private readonly readyPlugins = new WeakSet<InstalledPlugin>();
+  private readonly hydration = new WeakMap<InstalledPlugin, Promise<boolean>>();
+  private readonly initializations = new Map<string, object>();
   private snapshot: InstalledPlugin[] = [];
   private readonly disposed = new WeakSet<InstalledPlugin>();
   private readonly evaluationErrors = new Map<string, string>();
@@ -29,6 +33,13 @@ export class PluginRegistry {
   };
 
   getSnapshot = (): InstalledPlugin[] => this.snapshot;
+
+  isHostDisplayReady = (serverId: string): boolean => this.displayReady.has(serverId);
+
+  allowHostDisplay(serverId: string): void {
+    this.displayReady.add(serverId);
+    this.publish();
+  }
 
   getEvaluationError(serverId: string, pluginId: string): string | undefined {
     return this.evaluationErrors.get(`${serverId}/${pluginId}`);
@@ -56,6 +67,10 @@ export class PluginRegistry {
       );
       return existing ? [existing] : [];
     });
+    const generation = {};
+    this.initializations.set(serverId, generation);
+    let failed = false;
+    if (preserved.length !== catalog.length) this.displayReady.delete(serverId);
     const removed = previous.filter((plugin) => !preserved.includes(plugin));
     if (removed.length > 0) {
       this.byHost.set(serverId, preserved);
@@ -97,10 +112,49 @@ export class PluginRegistry {
           timelineRenderers: [],
         };
         runtime = this.dependencies.createRuntime(installation, options.client);
-        const evaluated = runPluginClientBundle(entry.id, entry.clientBundle, runtime, () =>
-          this.publish(),
+        const pending: Promise<unknown>[] = [];
+        let initializing = true;
+        const rpc = runtime.rpc;
+        const evaluated = runPluginClientBundle(
+          entry.id,
+          entry.clientBundle,
+          {
+            ...runtime,
+            rpc(definition, input) {
+              const request = rpc(definition, input);
+              if (initializing) pending.push(request);
+              return request;
+            },
+          },
+          () => this.publish(),
         );
         Object.assign(installation, evaluated);
+        if (pending.length === 0) {
+          initializing = false;
+          this.readyPlugins.add(installation);
+        } else {
+          this.hydration.set(
+            installation,
+            (async () => {
+              let completed = 0;
+              while (completed < pending.length) {
+                const batch = pending.slice(completed);
+                completed = pending.length;
+                const outcomes = await Promise.allSettled(batch);
+                if (
+                  installation.lifetime.signal.aborted ||
+                  outcomes.some((outcome) => outcome.status === "rejected")
+                ) {
+                  initializing = false;
+                  return false;
+                }
+              }
+              initializing = false;
+              this.readyPlugins.add(installation);
+              return true;
+            })(),
+          );
+        }
         const paseo = runtime.paseo;
         installation.cleanup = async () => {
           const results = await Promise.allSettled([paseo.dispose(), evaluated.cleanup()]);
@@ -114,6 +168,7 @@ export class PluginRegistry {
         this.evaluationErrors.delete(key);
         return [installation];
       } catch (error) {
+        failed = true;
         lifetime?.abort();
         void runtime?.paseo
           .dispose()
@@ -130,6 +185,22 @@ export class PluginRegistry {
       }
     }
     this.byHost.set(serverId, installed);
+    if (!failed && installed.every((plugin) => this.readyPlugins.has(plugin))) {
+      this.initializations.delete(serverId);
+      this.displayReady.add(serverId);
+    } else if (!failed) {
+      // Setup continuations consume these same RPC promises before display becomes ready.
+      void Promise.all(
+        installed.map((plugin) => this.hydration.get(plugin) ?? Promise.resolve(true)),
+      ).then((outcomes) => {
+        if (this.initializations.get(serverId) !== generation || outcomes.includes(false))
+          return undefined;
+        this.initializations.delete(serverId);
+        this.displayReady.add(serverId);
+        this.publish();
+        return undefined;
+      });
+    }
     this.publish();
     const installedTimelineBundles = installed
       .filter((plugin) => plugin.timelineTransformers.length > 0)
@@ -142,7 +213,12 @@ export class PluginRegistry {
 
   removeHost(serverId: string): void {
     const installed = this.byHost.get(serverId);
-    if (!installed) return;
+    this.displayReady.delete(serverId);
+    this.initializations.delete(serverId);
+    if (!installed) {
+      this.publish();
+      return;
+    }
     for (const plugin of installed) this.dispose(plugin);
     for (const key of this.evaluationErrors.keys()) {
       if (key.startsWith(`${serverId}/`)) this.evaluationErrors.delete(key);
@@ -199,4 +275,12 @@ export function useInstalledPlugin(serverId: string, pluginId: string): Installe
 export function usePluginInstallations(pluginId: string): InstalledPlugin[] {
   const installed = useInstalledPlugins();
   return useMemo(() => installed.filter((plugin) => plugin.id === pluginId), [installed, pluginId]);
+}
+
+export function useHostPluginDisplayReady(serverId: string): boolean {
+  return useSyncExternalStore(
+    pluginRegistry.subscribe,
+    () => pluginRegistry.isHostDisplayReady(serverId),
+    () => pluginRegistry.isHostDisplayReady(serverId),
+  );
 }

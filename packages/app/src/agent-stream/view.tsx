@@ -105,7 +105,7 @@ import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useStreamHistoryWindow } from "./use-stream-history-window";
-import { PluginTimelineItemView, useInstalledTimelineTransform } from "@/plugins/timeline";
+import { PluginTimelineItemView, useInstalledTimelineDisplayPolicy } from "@/plugins/timeline";
 
 function renderLiveAuxiliaryNode(input: {
   pendingPermissions: ReactNode;
@@ -373,7 +373,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     // Get serverId (fallback to agent's serverId if not provided)
     const resolvedServerId = serverId ?? context.serverId ?? "";
-    const transformTimelineItem = useInstalledTimelineTransform(resolvedServerId);
+    const { transform: transformTimelineItem, requiresSourceItems } =
+      useInstalledTimelineDisplayPolicy(resolvedServerId);
 
     const client = useSessionStore((state) => state.sessions[resolvedServerId]?.client ?? null);
     const sessionStreamHead = useSessionStore((state) =>
@@ -385,10 +386,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
     );
-    const supportsChatOutline = useSessionStore(
-      (state) =>
-        state.sessions[resolvedServerId]?.serverInfo?.features?.agentTimelinePromptIndex === true,
-    );
+    const supportsChatOutline = useSessionStore((state) => {
+      const features = state.sessions[resolvedServerId]?.serverInfo?.features;
+      return (
+        features?.agentTimelinePromptIndex === true &&
+        (!requiresSourceItems || features.agentTimelinePromptDisplayItems === true)
+      );
+    });
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
     );
@@ -627,6 +631,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       onJumpError: handleTimelineHistoryLoadError,
       visibleMessageIds,
       revealLoadedMessage: revealLoadedHistory,
+      transformTimelineItem,
+      requiresSourceItems,
     });
 
     useImperativeHandle(
@@ -1133,6 +1139,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             </MessageOuterSpacingProvider>
             <ChatOutlineRail
               prompts={chatOutline.prompts}
+              sourceUnavailable={chatOutline.sourceUnavailable}
+              onRetrySources={chatOutline.retrySources}
               activePrompt={chatOutline.activePrompt}
               onJumpToPrompt={chatOutline.jumpToPrompt}
             />

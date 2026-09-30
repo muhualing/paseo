@@ -24,6 +24,13 @@ interface TrackedProjectPickerFixture extends ProjectPickerFixture {
 // reliably for every test that uses this `test` object.
 const metroTest = base.extend({
   baseURL: async ({}, provide) => {
+    if (process.env.E2E_INSTALLED_WEB_UI === "1") {
+      if (!process.env.E2E_SERVER_PACKAGE_ROOT) {
+        throw new Error("Installed static UI regression requires an isolated package root");
+      }
+      await provide(`http://127.0.0.1:${getE2EDaemonPort()}`);
+      return;
+    }
     const metroPort = process.env.E2E_METRO_PORT;
     if (!metroPort) {
       throw new Error("E2E_METRO_PORT not set - globalSetup must run first");

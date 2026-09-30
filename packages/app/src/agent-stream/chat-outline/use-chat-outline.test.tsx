@@ -30,13 +30,13 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-describe("useChatOutline", () => {
-  beforeEach(() => {
-    runtime.listAgentTimelinePrompts.mockReset();
-    runtime.fetchAgentTimeline.mockReset();
-    runtime.subscribeAgentTimeline.mockClear();
-  });
+beforeEach(() => {
+  runtime.listAgentTimelinePrompts.mockReset();
+  runtime.fetchAgentTimeline.mockReset();
+  runtime.subscribeAgentTimeline.mockClear();
+});
 
+describe("useChatOutline", () => {
   it("waits for a served timeline before requesting its prompt index", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({ epoch: "epoch-1", prompts: [] });
     const viewportRef = createRef<StreamViewportHandle>();
@@ -401,4 +401,245 @@ describe("useChatOutline", () => {
     await act(async () => result.current.jumpToPrompt(2));
     expect(scrollToMessage).toHaveBeenCalledWith("live-prompt");
   });
+});
+
+it("applies the transcript display policy to complete source items, never preview text", async () => {
+  const hidden = {
+    type: "user_message",
+    text: "automatic input",
+    messageId: "trusted",
+    clientMessageId: "scheduled:1",
+  };
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-1",
+    nextCursor: null,
+    prompts: [
+      { seq: 1, timestamp: "2026-01-01", preview: "automatic input", item: hidden },
+      {
+        seq: 2,
+        timestamp: "2026-01-01",
+        preview: "automatic input",
+        item: { ...hidden, messageId: "paste", clientMessageId: "ordinary:1" },
+      },
+      { seq: 3, timestamp: "2026-01-01", preview: "automatic input" },
+    ],
+  });
+  const transform = vi.fn(({ item }) => (item.clientMessageId === "scheduled:1" ? [] : undefined));
+  const { result, rerender } = renderHook(
+    ({ policy }) =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch-1",
+        tail: [],
+        head: [],
+        enabled: true,
+        viewportRef: createRef<StreamViewportHandle>(),
+        onJumpError: vi.fn(),
+        transformTimelineItem: policy,
+      }),
+    { initialProps: { policy: transform } },
+  );
+  await waitFor(() => expect(runtime.listAgentTimelinePrompts).toHaveBeenCalled());
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([2]));
+  expect(transform).toHaveBeenCalledWith(
+    expect.objectContaining({ item: hidden, phase: "complete" }),
+  );
+  rerender({ policy: vi.fn(() => undefined) });
+  expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2]);
+});
+
+it("paginates source bodies once and reuses them when the display policy changes", async () => {
+  const prompt = (seq: number) => ({
+    seq,
+    timestamp: "now",
+    preview: "short",
+    item: { type: "user_message" as const, text: "complete text", messageId: `message-${seq}` },
+  });
+  runtime.listAgentTimelinePrompts
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(1)], nextCursor: 1 })
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(2)], nextCursor: null })
+    .mockResolvedValueOnce({ epoch: "epoch-1", prompts: [prompt(3)], nextCursor: null });
+  const initialPolicy = vi.fn(() => undefined);
+  const props = { policy: initialPolicy, tail: [] as import("@/types/stream").StreamItem[] };
+  const { result, rerender } = renderHook(
+    ({ policy, tail }) =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch-1",
+        tail,
+        head: [],
+        enabled: true,
+        viewportRef: createRef<StreamViewportHandle>(),
+        onJumpError: vi.fn(),
+        transformTimelineItem: policy,
+      }),
+    { initialProps: props },
+  );
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2]));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenNthCalledWith(2, "agent-1", {
+    includeItems: true,
+    cursor: 1,
+  });
+  rerender({ ...props, policy: vi.fn(() => undefined) });
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(2);
+  rerender({
+    ...props,
+    tail: [
+      {
+        kind: "user_message",
+        id: "message-3",
+        messageId: "message-3",
+        text: "complete text",
+        timestamp: new Date(),
+        timelineCursor: { epoch: "epoch-1", seq: 3 },
+      },
+    ],
+  });
+  await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([1, 2, 3]));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenNthCalledWith(3, "agent-1", {
+    includeItems: true,
+    cursor: 2,
+  });
+});
+
+it("keeps ordinary preview navigation without transferring bodies when the display policy is explicitly absent", async () => {
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-1",
+    prompts: [{ seq: 1, timestamp: "now", preview: "ordinary large message" }],
+  });
+  const { result } = renderHook(() =>
+    useChatOutline({
+      agentId: "agent-1",
+      serverId: "server-1",
+      timelineEpoch: "epoch-1",
+      tail: [],
+      head: [],
+      enabled: true,
+      viewportRef: createRef<StreamViewportHandle>(),
+      onJumpError: vi.fn(),
+      transformTimelineItem: () => undefined,
+      requiresSourceItems: false,
+    }),
+  );
+  await waitFor(() => expect(result.current.prompts).toHaveLength(1));
+  expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledWith("agent-1");
+});
+
+for (const text of ["x".repeat(72000), "普通问题".repeat(6000)]) {
+  for (const loaded of [true, false]) {
+    it(`resolves complete ${text[0] === "x" ? "ASCII" : "multibyte"} sources from ${loaded ? "loaded canonical rows" : "exact timeline reads"}`, async () => {
+      const { buildTimelinePromptIndex } =
+        await import("../../../../server/src/server/agent/timeline-prompt-index");
+      const rows = ["ordinary:1", "scheduled:1"].map((clientMessageId, i) => ({
+        seq: i + 1,
+        timestamp: "now",
+        item: { type: "user_message" as const, text, messageId: `id-${i}`, clientMessageId },
+      }));
+      const page = buildTimelinePromptIndex("epoch-1", rows, { includeItems: true });
+      expect(page.prompts.every((p) => !p.item)).toBe(true);
+      runtime.listAgentTimelinePrompts.mockResolvedValue(page);
+      runtime.fetchAgentTimeline.mockImplementation(async (_id, options) => ({
+        epoch: "epoch-1",
+        entries: rows
+          .filter((r) => r.seq === options.cursor.seq - 1)
+          .map((r) => ({ seqStart: r.seq, seqEnd: r.seq, item: r.item })),
+      }));
+      const tail = loaded
+        ? rows.map((r) => ({
+            kind: "user_message" as const,
+            id: r.item.messageId,
+            text: r.item.text,
+            messageId: r.item.messageId,
+            clientMessageId: r.item.clientMessageId,
+            timestamp: new Date(),
+            timelineCursor: { epoch: "epoch-1", seq: r.seq },
+          }))
+        : [];
+      const policy = vi.fn(({ item }) => (item.clientMessageId === "scheduled:1" ? [] : undefined));
+      const { result, rerender } = renderHook(
+        ({ requiresSourceItems }) =>
+          useChatOutline({
+            agentId: "agent-1",
+            serverId: "server-1",
+            timelineEpoch: "epoch-1",
+            tail,
+            head: [],
+            enabled: true,
+            viewportRef: createRef<StreamViewportHandle>(),
+            onJumpError: vi.fn(),
+            transformTimelineItem: policy,
+            requiresSourceItems,
+          }),
+        { initialProps: { requiresSourceItems: true } },
+      );
+      await waitFor(() => expect(result.current.prompts.map((p) => p.seq)).toEqual([1]));
+      expect(policy).toHaveBeenCalledWith(expect.objectContaining({ item: rows[0].item }));
+      if (loaded) expect(runtime.fetchAgentTimeline).not.toHaveBeenCalled();
+      else {
+        expect(runtime.fetchAgentTimeline).toHaveBeenCalledTimes(2);
+        expect(runtime.fetchAgentTimeline).toHaveBeenCalledWith("agent-1", {
+          direction: "before",
+          cursor: { epoch: "epoch-1", seq: 2 },
+          limit: 1,
+          projection: "projected",
+        });
+      }
+      rerender({ requiresSourceItems: false });
+      await waitFor(() => expect(result.current.prompts).toHaveLength(2));
+    });
+  }
+}
+it("offers retry on unavailable sources and rejects wrong epochs or sequences", async () => {
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-1",
+    prompts: [{ seq: 4, timestamp: "now", preview: "ordinary" }],
+  });
+  runtime.fetchAgentTimeline.mockRejectedValue(new Error("disconnected"));
+  const { result, rerender } = renderHook(
+    ({ epoch }) =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: epoch,
+        tail: [],
+        head: [],
+        enabled: true,
+        viewportRef: createRef<StreamViewportHandle>(),
+        onJumpError: vi.fn(),
+        transformTimelineItem: () => undefined,
+      }),
+    { initialProps: { epoch: "epoch-1" } },
+  );
+  await waitFor(() => expect(result.current.sourceUnavailable).toBe(true));
+  expect(result.current.prompts).toEqual([]);
+  for (const [epoch, seq] of [
+    ["epoch-2", 4],
+    ["epoch-1", 3],
+  ] as const) {
+    runtime.fetchAgentTimeline.mockResolvedValue({
+      epoch,
+      entries: [{ seqStart: seq, seqEnd: seq, item: { type: "user_message", text: "wrong row" } }],
+    });
+    act(() => result.current.retrySources());
+    await waitFor(() => expect(result.current.sourceUnavailable).toBe(true));
+    expect(result.current.prompts).toEqual([]);
+  }
+  runtime.fetchAgentTimeline.mockResolvedValue({
+    epoch: "epoch-1",
+    entries: [
+      { seqStart: 4, seqEnd: 4, item: { type: "user_message", text: "complete ordinary" } },
+    ],
+  });
+  act(() => result.current.retrySources());
+  await waitFor(() => expect(result.current.prompts).toHaveLength(1));
+  expect(result.current.sourceUnavailable).toBe(false);
+  runtime.listAgentTimelinePrompts.mockResolvedValue({
+    epoch: "epoch-2",
+    prompts: [{ seq: 4, timestamp: "now", preview: "new epoch" }],
+  });
+  rerender({ epoch: "epoch-2" });
+  expect(result.current.prompts).toEqual([]);
+  await waitFor(() => expect(result.current.sourceUnavailable).toBe(true));
 });

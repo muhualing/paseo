@@ -15,6 +15,7 @@ export interface TimelineItemTransformInput {
   item: AgentTimelineItem;
   phase: "streaming" | "complete";
   sourceId: string;
+  canonical?: boolean;
 }
 
 export type TimelineItemTransform = (

@@ -7818,7 +7818,7 @@ export class Session {
         direction: "tail",
         limit: 1,
       });
-      const index = buildTimelinePromptIndex(timeline.epoch, rows);
+      const index = buildTimelinePromptIndex(timeline.epoch, rows, msg);
       this.emitForSource(
         {
           type: "agent.timeline.list_prompts.response",

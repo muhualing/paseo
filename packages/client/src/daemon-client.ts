@@ -3287,13 +3287,15 @@ export class DaemonClient {
 
   async listAgentTimelinePrompts(
     agentId: string,
-    options: { requestId?: string; timeout?: number } = {},
+    options: { requestId?: string; timeout?: number; includeItems?: boolean; cursor?: number } = {},
   ): Promise<AgentTimelinePromptIndexPayload> {
     const requestId = this.createRequestId(options.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "agent.timeline.list_prompts.request",
       agentId,
       requestId,
+      includeItems: options.includeItems,
+      cursor: options.cursor,
     });
     const payload = await this.sendRequest({
       requestId,
