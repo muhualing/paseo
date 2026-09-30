@@ -11417,3 +11417,335 @@ test("failed startup history closes the session without registering an agent", a
     for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
   }
 });
+
+test("submitted native echo provenance survives history rebuild and storage reopen", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "prompt-provenance-"));
+  const raw: AgentStreamEvent[] = [
+    "native-auto",
+    "native-manual",
+    "native-ordinary",
+    "native-progress",
+  ].map((messageId) => ({
+    type: "timeline",
+    provider: "codex",
+    item: { type: "user_message", text: "same text", messageId },
+  }));
+  const nativeIds: Record<string, string> = {
+    "automation-input": "native-auto",
+    "manual-input": "native-manual",
+    "progress-input": "native-progress",
+  };
+  class ProvenanceSession extends TestAgentSession {
+    private provenanceTurnCount = 0;
+    override describePersistence() {
+      return { provider: this.provider, sessionId: "provenance-session" };
+    }
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield* raw;
+    }
+    override async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions) {
+      const turnId = `provenance-turn-${++this.provenanceTurnCount}`;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "user_message",
+            text: typeof prompt === "string" ? prompt : "",
+            messageId: nativeIds[options?.clientMessageId ?? ""],
+            clientMessageId: options?.clientMessageId,
+          },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+  }
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new ProvenanceSession(config);
+    }
+    override async resumeSession() {
+      return new ProvenanceSession({ provider: "codex", cwd: workdir });
+    }
+  })();
+  let manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+  });
+  let id = "";
+  const expectRestored = () =>
+    expect(manager.getTimeline(id)).toEqual([
+      {
+        type: "user_message",
+        text: "same text",
+        messageId: "native-auto",
+        clientMessageId: "automation-input",
+      },
+      {
+        type: "user_message",
+        text: "same text",
+        messageId: "native-manual",
+        clientMessageId: "manual-input",
+      },
+      { type: "user_message", text: "same text", messageId: "native-ordinary" },
+      {
+        type: "user_message",
+        text: "same text",
+        messageId: "native-progress",
+        clientMessageId: "progress-input",
+      },
+    ]);
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    id = created.id;
+    await manager.runAgent(id, "same text", { clientMessageId: "automation-input" });
+    await manager.runAgent(id, "same text", { clientMessageId: "manual-input" });
+    await manager.runAgent(id, "same text", { clientMessageId: "progress-input" });
+    await manager.flush();
+    const beforeEpoch = manager.fetchTimeline(id).epoch;
+    await manager.reloadAgentSession(id, undefined, { rehydrateFromDisk: true });
+    expect(manager.fetchTimeline(id).epoch).not.toBe(beforeEpoch);
+    await manager.hydrateTimelineFromProvider(id);
+    expectRestored();
+    await manager.closeAgent(id);
+    await manager.flush();
+    manager = new AgentManager({
+      clients: { codex: client },
+      registry: new AgentStorage(join(workdir, "agents"), logger),
+      logger,
+    });
+    await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "provenance-session", metadata: { cwd: workdir } },
+      undefined,
+      id,
+    );
+    await manager.hydrateTimelineFromProvider(id);
+    expectRestored();
+    await manager.hydrateTimelineFromProvider(id, { force: true });
+    expectRestored();
+    expect(raw).toEqual(
+      ["native-auto", "native-manual", "native-ordinary", "native-progress"].map((messageId) => ({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "same text", messageId },
+      })),
+    );
+  } finally {
+    if (id) await manager.closeAgent(id).catch(() => undefined);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  "unsolicited",
+  "failed-send",
+  "legacy-id",
+  "reload-after-bind",
+  "completed-without-echo",
+  "failed-steer",
+])("unaccepted native echo cannot persist provenance: %s", async (scenario) => {
+  const workdir = mkdtempSync(join(tmpdir(), "unaccepted-provenance-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const raw: AgentStreamEvent[] = [
+    {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text: "same text", messageId: "native-unsolicited" },
+    },
+  ];
+  let session: NegativeSession;
+  class NegativeSession extends TestAgentSession {
+    override describePersistence() {
+      return { provider: "codex", sessionId: "negative-session" };
+    }
+    override async *streamHistory() {
+      yield* raw;
+    }
+    override async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions) {
+      if (scenario === "failed-send") throw new Error("Send rejected before acceptance");
+      const turnId = "accepted-turn";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: "codex", turnId });
+        if (scenario === "reload-after-bind")
+          this.pushEvent({
+            type: "timeline",
+            provider: "codex",
+            turnId,
+            item: {
+              type: "user_message",
+              text: typeof prompt === "string" ? prompt : "",
+              messageId: "native-accepted",
+              clientMessageId: options?.clientMessageId,
+            },
+          });
+        if (scenario !== "failed-steer")
+          this.pushEvent({ type: "turn_completed", provider: "codex", turnId });
+      }, 0);
+      return { turnId };
+    }
+    async steerActiveTurn() {
+      return { status: "unavailable" } as const;
+    }
+  }
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      session = new NegativeSession(config);
+      return session;
+    }
+    override async resumeSession() {
+      session = new NegativeSession({ provider: "codex", cwd: workdir });
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const sourceId = "automatic-input";
+  let running: Promise<AgentRunResult> | undefined;
+  try {
+    if (scenario === "failed-send")
+      await expect(
+        manager.runAgent(created.id, "same text", { clientMessageId: sourceId }),
+      ).rejects.toThrow("Send rejected before acceptance");
+    if (scenario === "legacy-id") {
+      await manager.appendTimelineItem(created.id, {
+        type: "user_message",
+        text: "same text",
+        messageId: sourceId,
+        clientMessageId: sourceId,
+      });
+      await manager.hydrateTimelineFromProvider(created.id, { force: true });
+    }
+    if (scenario === "reload-after-bind" || scenario === "completed-without-echo") {
+      await manager.runAgent(created.id, "same text", { clientMessageId: sourceId });
+      await manager.reloadAgentSession(created.id);
+    }
+    if (scenario === "failed-steer") {
+      running = manager.runAgent(created.id, "initial");
+      await manager.waitForAgentRunStart(created.id);
+      expect(
+        await manager.steerAgentRun(created.id, "same text", { clientMessageId: sourceId }),
+      ).toEqual({ status: "unavailable" });
+    }
+    const echo: AgentStreamEvent = {
+      type: "timeline",
+      provider: "codex",
+      item: {
+        type: "user_message",
+        text: "same text",
+        messageId: "native-unsolicited",
+        clientMessageId: sourceId,
+      },
+    };
+    session!.pushEvent(echo);
+    await manager.flush();
+    session!.pushEvent(echo);
+    await manager.flush();
+    const bindings = await storage.getSubmittedPromptBindings(created.id);
+    expect(bindings.map((binding) => binding.providerMessageId)).toEqual(
+      scenario === "reload-after-bind" ? ["native-accepted"] : [],
+    );
+    await manager.hydrateTimelineFromProvider(created.id, { force: true });
+    expect(manager.getTimeline(created.id)).toEqual([
+      { type: "user_message", text: "same text", messageId: "native-unsolicited" },
+    ]);
+  } finally {
+    session!.pushEvent({ type: "turn_completed", provider: "codex", turnId: "accepted-turn" });
+    await running;
+    await manager.closeAgent(created.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("accepted steer authorizes exactly one native echo after admission", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "accepted-steer-provenance-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class Session extends SteeringTestSession {
+    override describePersistence() {
+      return { provider: "codex", sessionId: "steer-session" };
+    }
+    override async steerActiveTurn(
+      prompt: AgentPromptInput,
+      options: import("./agent-sdk-types.js").SteerActiveTurnOptions,
+    ): Promise<import("./agent-sdk-types.js").SteerResult> {
+      this.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        turnId: options.expectedTurnId,
+        item: {
+          type: "user_message",
+          text: typeof prompt === "string" ? prompt : "",
+          messageId: "native-steer",
+          clientMessageId: options.clientMessageId,
+        },
+      });
+      return { status: "accepted" };
+    }
+  }
+  const session = new Session({ provider: "codex", cwd: workdir });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession() {
+          return session;
+        }
+      })(),
+    },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  let run: Promise<AgentRunResult> | undefined;
+  try {
+    run = manager.runAgent(agent.id, "initial");
+    await manager.waitForAgentRunStart(agent.id);
+    expect(
+      await manager.steerAgentRun(agent.id, "same text", { clientMessageId: "source" }),
+    ).toEqual({ status: "accepted" });
+    await manager.flush();
+    expect(
+      (await storage.getSubmittedPromptBindings(agent.id)).map(
+        (binding) => binding.providerMessageId,
+      ),
+    ).toEqual(["native-steer"]);
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: "active-turn-1",
+      item: {
+        type: "user_message",
+        text: "same text",
+        messageId: "native-reused",
+        clientMessageId: "source",
+      },
+    });
+    await manager.flush();
+    expect(
+      (await storage.getSubmittedPromptBindings(agent.id)).map(
+        (binding) => binding.providerMessageId,
+      ),
+    ).toEqual(["native-steer"]);
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .find((item) => item.type === "user_message" && item.messageId === "native-reused"),
+    ).toEqual({ type: "user_message", text: "same text", messageId: "native-reused" });
+  } finally {
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await run;
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

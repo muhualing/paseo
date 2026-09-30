@@ -1,4 +1,12 @@
 import { projectTimelineRows } from "./timeline-projection.js";
+import {
+  MAX_SUBMITTED_PROMPT_BINDINGS,
+  MAX_SUBMITTED_PROMPT_ID_LENGTH,
+  promptTextSha256,
+  restoreSubmittedPromptProvenance,
+  type SubmittedPromptBinding,
+  type SubmittedPromptScope,
+} from "./submitted-prompt-provenance.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
@@ -385,6 +393,12 @@ function resolveInitialAttention(input: AttentionState | undefined): AttentionSt
   };
 }
 
+interface AcceptedSubmittedPrompt {
+  sessionId: string;
+  turnId: string;
+  textSha256: string;
+}
+
 interface StreamEventFlags {
   shouldDispatchEvent: boolean;
   shouldNotifyWaiters: boolean;
@@ -723,6 +737,12 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
+  // Rendering a user message does not prove provider admission. These one-use grants
+  // belong to the live session object and cannot survive reload or terminal events.
+  private readonly acceptedSubmittedPrompts = new WeakMap<
+    ActiveManagedAgent,
+    Map<string, AcceptedSubmittedPrompt | null>
+  >();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -2539,15 +2559,18 @@ export class AgentManager {
             (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
               event.type === "timeline" &&
               event.item.type === "user_message" &&
-              event.item.clientMessageId === options.clientMessageId,
+              event.item.clientMessageId === options.clientMessageId &&
+              event.item.text === submittedPromptText(prompt) &&
+              (!event.turnId || event.turnId === turnId),
           )
         : undefined;
       if (options?.clientMessageId) {
-        this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
+        this.recordAcceptedSubmittedPrompt(agent, prompt, options.clientMessageId, {
           messageId: options.clientMessageId,
           turnId,
           providerMessageId:
-            stagedSubmittedPromptEcho?.item.type === "user_message"
+            stagedSubmittedPromptEcho?.item.type === "user_message" &&
+            stagedSubmittedPromptEcho.item.text === submittedPromptText(prompt)
               ? stagedSubmittedPromptEcho.item.messageId
               : undefined,
         });
@@ -2657,6 +2680,7 @@ export class AgentManager {
     if (fromHistory) return "stale";
     if (!agent.activeTurnId) return "untracked";
     if (turnId && agent.activeTurnId !== turnId) return "stale";
+    this.acceptedSubmittedPrompts.delete(agent);
     agent.activeTurnId = null;
     agent.activeTurnStartedAt = null;
     return "closed_current";
@@ -2849,7 +2873,7 @@ export class AgentManager {
     if (!clientMessageId) {
       return;
     }
-    this.recordSubmittedPrompt(agent, prompt, clientMessageId, {
+    this.recordAcceptedSubmittedPrompt(agent, prompt, clientMessageId, {
       messageId: clientMessageId,
       turnId: expectedTurnId,
     });
@@ -3685,6 +3709,7 @@ export class AgentManager {
       return { timestamp: now.toISOString() };
     }
     return {
+      rows: await this.durableTimelineStore.getCommittedRows(agentId),
       nextSeq: (await this.durableTimelineStore.getLatestCommittedSeq(agentId)) + 1,
       timestamp: now.toISOString(),
     };
@@ -3992,6 +4017,7 @@ export class AgentManager {
     broadcast: boolean,
     broadcastTimeline: boolean,
   ): Promise<void> {
+    const bindings = await this.getSubmittedPromptBindings(agent);
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     for await (const rawEvent of agent.session.streamHistory()) {
@@ -4000,7 +4026,14 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: restoreSubmittedPromptProvenance(
+            event.item,
+            bindings,
+            this.getSubmittedPromptScope(agent),
+          ),
+        });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
       }
@@ -4048,6 +4081,7 @@ export class AgentManager {
       | AsyncIterable<AgentStreamEvent>
       | Iterable<AgentStreamEvent> = agent.session.streamHistory(),
   ): Promise<void> {
+    const bindings = await this.getSubmittedPromptBindings(agent);
     const deferredBroadcast = typeof broadcast === "function";
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const historySubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
@@ -4068,7 +4102,14 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: restoreSubmittedPromptProvenance(
+            event.item,
+            bindings,
+            this.getSubmittedPromptScope(agent),
+          ),
+        });
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
@@ -4398,7 +4439,8 @@ export class AgentManager {
     options: { fromHistory?: boolean } | undefined;
     flags: StreamEventFlags;
   }): Promise<void> {
-    const { agent, event, options, flags } = params;
+    const { agent, options, flags } = params;
+    let { event } = params;
 
     if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
       flags.shouldDispatchEvent = false;
@@ -4407,6 +4449,7 @@ export class AgentManager {
     }
 
     if (
+      !options?.fromHistory &&
       event.item.type === "user_message" &&
       event.item.clientMessageId &&
       this.reconcileSubmittedPromptEcho(agent, event.item, event.turnId)
@@ -4414,6 +4457,17 @@ export class AgentManager {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
+    }
+
+    if (event.item.type === "user_message") {
+      event = {
+        ...event,
+        item: restoreSubmittedPromptProvenance(
+          event.item,
+          await this.getSubmittedPromptBindings(agent),
+          this.getSubmittedPromptScope(agent),
+        ),
+      };
     }
 
     if (options?.fromHistory) {
@@ -4672,15 +4726,54 @@ export class AgentManager {
     return event;
   }
 
+  private recordAcceptedSubmittedPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    clientMessageId: string,
+    options: { messageId?: string; providerMessageId?: string; turnId: string },
+  ): void {
+    const sessionId = agent.session.describePersistence()?.sessionId;
+    if (sessionId && clientMessageId.length <= MAX_SUBMITTED_PROMPT_ID_LENGTH) {
+      let grants = this.acceptedSubmittedPrompts.get(agent);
+      if (!grants) {
+        grants = new Map();
+        this.acceptedSubmittedPrompts.set(agent, grants);
+      }
+      if (grants.has(clientMessageId) || grants.size < MAX_SUBMITTED_PROMPT_BINDINGS) {
+        grants.set(
+          clientMessageId,
+          grants.has(clientMessageId)
+            ? null
+            : {
+                sessionId,
+                turnId: options.turnId,
+                textSha256: promptTextSha256(submittedPromptText(prompt)),
+              },
+        );
+      }
+    }
+    this.recordSubmittedPrompt(agent, prompt, clientMessageId, options);
+    if (options.providerMessageId) {
+      this.reconcileSubmittedPromptEcho(
+        agent,
+        {
+          type: "user_message",
+          text: submittedPromptText(prompt),
+          clientMessageId,
+          messageId: options.providerMessageId,
+        },
+        options.turnId,
+      );
+    }
+  }
+
   private recordSubmittedPrompt(
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
-    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
-      return;
-    }
+    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) return;
     this.touchUpdatedAt(agent);
     agent.lastUserMessageAt = new Date();
     const item: AgentTimelineItem = {
@@ -4698,26 +4791,73 @@ export class AgentManager {
     turnId?: string,
   ): AgentTimelineRow | null {
     const { clientMessageId, messageId } = item;
-    if (!clientMessageId) return null;
-    let existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
-    if (!existing) {
-      this.recordSubmittedPrompt(agent, item.text, clientMessageId, {
-        messageId: clientMessageId,
-        ...(messageId ? { providerMessageId: messageId } : {}),
-        ...(turnId ? { turnId } : {}),
-      });
-      existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
-    }
-    if (!existing || existing.item.type !== "user_message") return null;
-    if (messageId) {
-      const enriched = this.timelineStore.enrichSubmittedUserMessage(
-        agent.id,
-        clientMessageId,
-        messageId,
-      );
-      if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
-    }
+    if (!clientMessageId || !messageId) return null;
+    const grants = this.acceptedSubmittedPrompts.get(agent);
+    const grant = grants?.get(clientMessageId);
+    if (
+      !grant ||
+      grant.sessionId !== agent.session.describePersistence()?.sessionId ||
+      grant.turnId !== (turnId ?? agent.activeTurnId) ||
+      grant.turnId !== agent.activeTurnId ||
+      grant.textSha256 !== promptTextSha256(item.text)
+    )
+      return null;
+    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    if (!existing || existing.item.type !== "user_message" || existing.item.text !== item.text)
+      return null;
+    grants!.delete(clientMessageId);
+    const enriched = this.timelineStore.enrichSubmittedUserMessage(
+      agent.id,
+      clientMessageId,
+      messageId,
+    );
+    if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
+    this.persistSubmittedPromptBinding(agent, item, messageId);
     return existing;
+  }
+
+  private persistSubmittedPromptBinding(
+    agent: ActiveManagedAgent,
+    item: AgentTimelineItem,
+    providerMessageId: string,
+  ): void {
+    const handle = agent.session.describePersistence();
+    if (
+      !this.registry ||
+      !handle?.sessionId ||
+      item.type !== "user_message" ||
+      !item.clientMessageId
+    )
+      return;
+    const binding: SubmittedPromptBinding = {
+      provider: agent.provider,
+      sessionId: handle.sessionId,
+      providerMessageId,
+      clientMessageId: item.clientMessageId,
+      textSha256: promptTextSha256(item.text),
+    };
+    const task = this.registry.recordSubmittedPromptBinding(agent.id, binding).catch((err) => {
+      this.logger.error({ err, agentId: agent.id }, "Failed to persist submitted prompt binding");
+    });
+    this.trackBackgroundTask(task);
+  }
+
+  private getSubmittedPromptScope(agent: ActiveManagedAgent): SubmittedPromptScope | undefined {
+    const sessionId = agent.session.describePersistence()?.sessionId;
+    if (!sessionId) return undefined;
+    return { provider: agent.provider, sessionId };
+  }
+
+  private async getSubmittedPromptBindings(
+    agent: ActiveManagedAgent,
+  ): Promise<SubmittedPromptBinding[]> {
+    const handle = agent.session.describePersistence();
+    if (!handle?.sessionId) return [];
+    await this.registry?.flush();
+    const bindings = (await this.registry?.getSubmittedPromptBindings(agent.id)) ?? [];
+    return bindings.filter(
+      (binding) => binding.provider === agent.provider && binding.sessionId === handle.sessionId,
+    );
   }
 
   private async appendSystemErrorTimelineMessage(

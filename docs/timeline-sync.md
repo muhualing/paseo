@@ -8,7 +8,11 @@ Agent chat delivery has two paths:
 The daemon retains projected items in memory. Each source event advances the stream sequence,
 then replaces the previous tool state or merges into the current text item. Intermediate payloads
 are never retained for history or catch-up. Provider history is the durable transcript authority
-and rebuilds the projection when an agent resumes.
+and rebuilds the projection when an agent resumes. Submitted prompt identity is stored separately
+in the session record, after a native echo acknowledges an accepted submission. Restoring it requires
+the same provider, native session, native message ID, and text digest. Conflicting or damaged bindings
+leave the native message visible. Older transcripts without a saved native binding cannot recover
+submission identity from matching text.
 
 The invariants are:
 
