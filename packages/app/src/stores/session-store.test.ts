@@ -825,3 +825,31 @@ it("retains advertised catalog permissions so a reconnect can revoke a display t
     toDaemonServerInfo({ status: "server_info", serverId: "host", hostname: null, version: null }),
   ).not.toHaveProperty("permissions");
 });
+
+it("stores reader permissions and publishes permission-only revocation without changing host features", () => {
+  const store = useSessionStore.getState();
+  store.initializeSession("test-server", null as unknown as DaemonClient);
+  const info = {
+    serverId: "test-server",
+    hostname: "host",
+    version: "0.10.2",
+    features: { plugins: true },
+    permissions: ["daemon.manage", "workspace.read"] as const,
+  };
+  store.updateSessionServerInfo("test-server", { ...info, permissions: [...info.permissions] });
+  expect(useSessionStore.getState().sessions["test-server"].serverInfo?.permissions).toEqual([
+    "daemon.manage",
+    "workspace.read",
+  ]);
+  store.updateSessionServerInfo("test-server", { ...info, permissions: ["workspace.read"] });
+  expect(useSessionStore.getState().sessions["test-server"].serverInfo?.permissions).toEqual([
+    "workspace.read",
+  ]);
+  store.updateSessionServerInfo("test-server", { ...info, permissions: [] });
+  expect(useSessionStore.getState().sessions["test-server"].serverInfo?.permissions).toEqual([]);
+  const { permissions: _permissions, ...legacy } = info;
+  store.updateSessionServerInfo("test-server", legacy);
+  expect(useSessionStore.getState().sessions["test-server"].serverInfo).not.toHaveProperty(
+    "permissions",
+  );
+});

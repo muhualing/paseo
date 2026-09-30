@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   status: "online",
   known: true,
   access: true,
+  read: false,
   rpc: vi.fn(),
 }));
 vi.mock("@/runtime/host-runtime", () => ({
@@ -31,7 +32,14 @@ vi.mock("@/stores/session-store", () => ({
     select({
       sessions: {
         host: {
-          serverInfo: state.known ? { permissions: state.access ? ["daemon.manage"] : [] } : null,
+          serverInfo: state.known
+            ? {
+                permissions: [
+                  ...(state.access ? ["daemon.manage"] : []),
+                  ...(state.read ? ["workspace.read"] : []),
+                ],
+              }
+            : null,
         },
       },
     }),
@@ -50,6 +58,7 @@ afterEach(() => {
     status: "online",
     known: true,
     access: true,
+    read: false,
   });
 });
 
@@ -183,3 +192,66 @@ for (const reason of ["credentials", "permissions"] as const) {
     rendered.unmount();
   });
 }
+
+for (const cold of [true, false]) {
+  test(`authenticated reader retains ordinary history after ${cold ? "cold load" : "management revocation"}`, async () => {
+    const client = catalogClient();
+    state.read = true;
+    state.access = !cold;
+    const rendered = render(<PluginCatalogSync serverId="host" client={client} />);
+    if (!cold) await waitFor(() => expect(pluginRegistry.getSnapshot()).toHaveLength(1));
+    act(() => {
+      state.access = false;
+      rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+    });
+    expect(pluginRegistry.getSnapshot()).toHaveLength(0);
+    expect(pluginRegistry.isHostDisplayReady("host")).toBe(true);
+    act(() => {
+      state.connected = false;
+      rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+    });
+    expect(pluginRegistry.isHostDisplayReady("host")).toBe(true);
+    act(() => {
+      state.connected = true;
+      rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+    });
+    const { result, unmount } = renderHook(() => useInstalledTimelineDisplayPolicy("host"));
+    for (const type of ["user_message", "assistant_message"] as const) {
+      expect(
+        result.current.transform({
+          item: { type, text: "ordinary history" },
+          phase: "complete",
+          sourceId: type,
+        }),
+      ).toBeUndefined();
+    }
+    act(() => {
+      state.status = "auth-error";
+      rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+    });
+    expect(pluginRegistry.isHostDisplayReady("host")).toBe(false);
+    act(() => {
+      state.status = "online";
+      rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+    });
+    expect(pluginRegistry.isHostDisplayReady("host")).toBe(true);
+    rendered.unmount();
+    unmount();
+    expect(pluginRegistry.isHostDisplayReady("host")).toBe(false);
+  });
+}
+test("catalog access denial permits only an authenticated history reader", async () => {
+  state.read = true;
+  const client = catalogClient();
+  vi.mocked(client.getPluginCatalog).mockRejectedValue(
+    Object.assign(new Error("denied"), { code: "access_denied" }),
+  );
+  const rendered = render(<PluginCatalogSync serverId="host" client={client} />);
+  await waitFor(() => expect(pluginRegistry.isHostDisplayReady("host")).toBe(true));
+  act(() => {
+    state.read = false;
+    rendered.rerender(<PluginCatalogSync serverId="host" client={client} />);
+  });
+  await waitFor(() => expect(pluginRegistry.isHostDisplayReady("host")).toBe(false));
+  rendered.unmount();
+});

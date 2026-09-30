@@ -1139,6 +1139,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             </MessageOuterSpacingProvider>
             <ChatOutlineRail
               prompts={chatOutline.prompts}
+              sourceUnavailable={chatOutline.sourceUnavailable}
+              onRetrySources={chatOutline.retrySources}
               activePrompt={chatOutline.activePrompt}
               onJumpToPrompt={chatOutline.jumpToPrompt}
             />

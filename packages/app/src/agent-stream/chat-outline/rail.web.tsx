@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, Text, View, type PointerEvent as RNPointerEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -26,7 +27,10 @@ export const ChatOutlineRail = memo(function ChatOutlineRail({
   prompts,
   activePrompt,
   onJumpToPrompt,
+  sourceUnavailable,
+  onRetrySources,
 }: ChatOutlineRailProps) {
+  const { t } = useTranslation();
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
   const activeSeq = useSyncExternalStore(activePrompt.subscribe, activePrompt.getActiveSeq);
@@ -74,7 +78,7 @@ export const ChatOutlineRail = memo(function ChatOutlineRail({
   // same band and the same preview once the pointer leaves.
   const attentionIndex = hoveredIndex ?? focusedIndex;
 
-  if (prompts.length < 2) return null;
+  if (prompts.length < 2 && !sourceUnavailable) return null;
 
   return (
     <View style={styles.panelMeasure} pointerEvents="box-none" onLayout={onLayout}>
@@ -87,6 +91,16 @@ export const ChatOutlineRail = memo(function ChatOutlineRail({
           onPointerMove={handlePointerMoveRail}
           onPointerLeave={handlePointerLeaveRail}
         >
+          {sourceUnavailable ? (
+            <Pressable
+              onPress={onRetrySources}
+              accessibilityRole="button"
+              accessibilityLabel={t("agentStream.historyLoadFailed")}
+              testID="chat-outline-retry"
+            >
+              <Text style={styles.previewText}>{t("common.actions.retry")}</Text>
+            </Pressable>
+          ) : null}
           {prompts.map((prompt, index) => (
             <ChatOutlineTick
               key={prompt.seq}

@@ -21,14 +21,33 @@ export function PluginCatalogSync({
     (state) =>
       state.sessions[serverId]?.serverInfo?.permissions?.includes("daemon.manage") !== false,
   );
+  const canReadHistory = useSessionStore(
+    (state) =>
+      state.sessions[serverId]?.serverInfo?.permissions?.includes("workspace.read") === true,
+  );
   const supported = useHostFeature(serverId, "plugins");
 
   useEffect(() => {
     let cancelled = false;
     let refreshQueue = Promise.resolve();
-    if (authFailure || !hasAccess) {
+    if (authFailure) {
       // Rejected credentials and revoked access must not retain a previous trust scope.
       pluginRegistry.removeHost(serverId);
+      return;
+    }
+    if (!hasAccess) {
+      // A previously authenticated reader keeps its plain cached display on transport loss.
+      if (
+        !connected &&
+        known &&
+        canReadHistory &&
+        pluginRegistry.isHostDisplayReady(serverId) &&
+        !pluginRegistry.getSnapshot().some((plugin) => plugin.serverId === serverId)
+      )
+        return;
+      pluginRegistry.removeHost(serverId);
+      // Catalog management is independent of authenticated transcript access.
+      if (connected && known && canReadHistory) pluginRegistry.allowHostDisplay(serverId);
       return;
     }
     if (!connected || !known) return;
@@ -52,8 +71,10 @@ export function PluginCatalogSync({
           })
           .catch((error) => {
             if (!cancelled) {
-              if (error instanceof Error && "code" in error && error.code === "access_denied")
+              if (error instanceof Error && "code" in error && error.code === "access_denied") {
                 pluginRegistry.removeHost(serverId);
+                if (canReadHistory) pluginRegistry.allowHostDisplay(serverId);
+              }
               console.warn(`[Plugins] Failed to load catalog for ${serverId}`, error);
             }
             return undefined;
@@ -92,7 +113,7 @@ export function PluginCatalogSync({
         .release()
         .catch((error) => console.warn("[Plugins] Failed to release catalog", error));
     };
-  }, [client, connected, known, serverId, authFailure, hasAccess, supported]);
+  }, [client, connected, known, serverId, authFailure, hasAccess, canReadHistory, supported]);
 
   useEffect(() => () => pluginRegistry.removeHost(serverId), [serverId, client]);
   return null;

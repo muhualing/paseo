@@ -210,3 +210,192 @@ test("display rules survive a browser disconnect and filter the outline before c
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("oversized ordinary prompts keep their outline and authenticated reader history remains visible", async ({
+  page,
+}, info) => {
+  info.setTimeout(180_000);
+  const directory = await mkdtemp(path.join(tmpdir(), "outline-large-"));
+  const client = await connectDaemonClient<
+    import("@getpaseo/client/internal/daemon-client").DaemonClient
+  >({ clientIdPrefix: "outline-large" });
+  const previous = await client.getDaemonConfig();
+  const agent = await seedMockAgentWorkspace({
+    repoPrefix: "outline-large-",
+    title: "Oversized prompt regression",
+    model: "ten-second-stream",
+    featureValues: {
+      mockStreamingAssistantResponse: "Visible fifteen-minute progress",
+      mockStreamingAssistantIntervalMs: 1,
+    },
+  });
+  let reader = false;
+  let readerInfoFrames = 0;
+  let readerSocket: import("@playwright/test").WebSocketRoute | null = null;
+  let serverInfoFrame: string | null = null;
+  const readerFrameTypes: Record<string, number> = {};
+  let failSourceReads = true;
+  const sourceRequestIds = new Set<string>();
+  let catalogRequests = 0;
+  const sourceReads: Array<{
+    cursor: { epoch: string; seq: number };
+    limit: number;
+    projection: string;
+  }> = [];
+  await page.routeWebSocket(daemonWsRoutePattern(), (socket) => {
+    readerSocket = socket;
+    const server = socket.connectToServer();
+    socket.onMessage((message) => {
+      const frame = JSON.parse(String(message));
+      if (frame.message?.type === "plugin.catalog.get.request") catalogRequests++;
+      if (frame.message?.type === "fetch_agent_timeline_request" && frame.message.limit === 1) {
+        sourceReads.push(frame.message);
+        sourceRequestIds.add(frame.message.requestId);
+      }
+      server.send(message);
+    });
+    server.onMessage((message) => {
+      const frame = JSON.parse(String(message));
+      if (frame.message?.payload?.status === "server_info") serverInfoFrame = String(message);
+      if (reader && frame.message?.type)
+        readerFrameTypes[frame.message.type] = (readerFrameTypes[frame.message.type] ?? 0) + 1;
+      // The published daemon admits local owner sessions. This fixture narrows only its
+      // advertised permission contract to exercise the client reader gate; server
+      // authorization is covered separately with a real workspace.read principal.
+      if (
+        failSourceReads &&
+        frame.message?.type === "fetch_agent_timeline_response" &&
+        sourceRequestIds.has(frame.message.payload.requestId)
+      ) {
+        frame.message.payload.error = "Temporary source read failure";
+        socket.send(JSON.stringify(frame));
+      } else if (reader && frame.message?.payload?.status === "server_info") {
+        readerInfoFrames++;
+        frame.message.payload.permissions = ["workspace.read"];
+        socket.send(JSON.stringify(frame));
+      } else socket.send(message);
+    });
+  });
+  await page.addInitScript(() =>
+    localStorage.setItem("@paseo:app-settings", JSON.stringify({ chatOutlineEnabled: true })),
+  );
+  try {
+    await writeFile(
+      path.join(directory, "paseo-plugin.json"),
+      JSON.stringify({ id: "outline-large", requirements: pluginRequirements }),
+    );
+    await writeFile(
+      path.join(directory, "index.client.tsx"),
+      `export default function(p){p.addTimelineTransformer({id:"source",query:{itemType:"user_message"},transform:({item})=>item.clientMessageId?.startsWith("scheduled:")?{items:[]}:undefined});return ()=>{};}`,
+    );
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    await client.installDirectoryPlugin(directory);
+    for (const [name, text] of [
+      ["ASCII", "A".repeat(72000)],
+      ["中文", "普通问题".repeat(6000)],
+    ] as const) {
+      for (const source of ["scheduled", "ordinary"]) {
+        await client.sendAgentMessage(
+          agent.agentId,
+          `${name} ${text} emit 1 coalesced agent stream updates`,
+          { messageId: `${source}:${name}` },
+        );
+        await client.waitForFinish(agent.agentId, 30000);
+      }
+    }
+    // Push the large prompts out of the initial 40-row projected window.
+    for (let i = 0; i < 22; i++) {
+      await client.sendAgentMessage(
+        agent.agentId,
+        "Background input: emit 1 coalesced agent stream updates",
+        { messageId: `scheduled:filler-${i}` },
+      );
+      await client.waitForFinish(agent.agentId, 30000);
+    }
+    // The bounded source index is paged; the legacy preview index covers all prompts.
+    expect((await client.listAgentTimelinePrompts(agent.agentId)).prompts).toHaveLength(26);
+    const original = await client.listAgentTimelinePrompts(agent.agentId, { includeItems: true });
+    expect(original.prompts).toHaveLength(4);
+    expect(original.nextCursor).not.toBeNull();
+    expect(original.prompts.slice(0, 4).every((prompt) => prompt.item === undefined)).toBe(true);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openAgentRoute(page, agent);
+    await expect(page.getByTestId("chat-outline-retry")).toBeVisible();
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(0);
+    failSourceReads = false;
+    await page.getByTestId("chat-outline-retry").click();
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(2);
+    for (const tick of await chatOutlineRail(page).getByRole("tab").all()) {
+      expect(await tick.getAttribute("aria-label")).toMatch(/ASCII|中文/);
+    }
+    for (const prompt of original.prompts.slice(0, 4)) {
+      expect(sourceReads).toContainEqual(
+        expect.objectContaining({
+          cursor: { epoch: original.epoch, seq: prompt.seq + 1 },
+          limit: 1,
+          projection: "projected",
+        }),
+      );
+    }
+    await chatOutlineRail(page).getByRole("tab").first().click();
+    await expect(page.getByTestId("user-message").filter({ hasText: "ASCII" })).toHaveCount(1);
+    await expect(page.getByTestId("chat-outline-retry")).toHaveCount(0);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(2);
+    await client.disablePlugin("outline-large");
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(26);
+    const after = await client.listAgentTimelinePrompts(agent.agentId, { includeItems: true });
+    expect(after.prompts).toEqual(original.prompts);
+    expect(after.epoch).toBe(original.epoch);
+    expect(after.nextCursor).toBe(original.nextCursor);
+    await client.enablePlugin("outline-large");
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(2);
+    reader = true;
+    catalogRequests = 0;
+    expect(serverInfoFrame).not.toBeNull();
+    const permissionUpdate = JSON.parse(serverInfoFrame!);
+    permissionUpdate.message.payload.permissions = ["workspace.read"];
+    expect(readerSocket).not.toBeNull();
+    readerSocket!.send(JSON.stringify(permissionUpdate));
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(26);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect.poll(() => page.getByTestId("user-message").count()).toBeGreaterThan(0);
+    await expect(
+      page.getByText("Visible fifteen-minute progress", { exact: true }).last(),
+    ).toBeVisible();
+    await expect(chatOutlineRail(page).getByRole("tab")).toHaveCount(26);
+    expect(catalogRequests).toBe(0);
+    await info.attach("oversized-reader", {
+      body: await page.screenshot({ path: info.outputPath("oversized-reader.png") }),
+      contentType: "image/png",
+    });
+  } catch (error) {
+    await info.attach("reader-contract-diagnostic", {
+      body: JSON.stringify({
+        reader,
+        readerInfoFrames,
+        readerFrameTypes,
+        catalogRequests,
+        sourceReadCount: sourceReads.length,
+        userCount: await page.getByTestId("user-message").count(),
+        outlineCount: await chatOutlineRail(page).getByRole("tab").count(),
+        workspaceUnavailable: await page
+          .getByText("Workspace unavailable", { exact: true })
+          .count(),
+        historyError: await page.getByTestId("chat-outline-retry").count(),
+      }),
+      contentType: "application/json",
+    });
+    await info.attach("before-cleanup", {
+      body: await page.screenshot({ path: info.outputPath("before-cleanup.png") }),
+      contentType: "image/png",
+    });
+    throw error;
+  } finally {
+    await client.removePlugin("outline-large").catch(() => undefined);
+    await client.patchDaemonConfig({ pluginsEnabled: previous.config.pluginsEnabled ?? false });
+    await client.close();
+    await agent.cleanup();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

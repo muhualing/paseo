@@ -445,8 +445,10 @@ The chat outline applies the same user-message transformers to complete source i
 cannot establish origin or verify a body hash. Hosts with `agentTimelinePromptDisplayItems` support
 opt-in source pages through `agent.timeline.list_prompts.request`; legacy requests retain their
 preview-only response. Source pages contain only the existing user-message fields, at most 50
-entries and 256 KiB of body data, with a 64 KiB limit per item. Oversized or unverified items have no
-outline entry while a user-message display policy applies. Hosts without the capability keep their
+entries and 256 KiB of body data, with a 64 KiB limit per item. When a source body is omitted,
+the outline reuses a loaded canonical row at that epoch and sequence, or reads exactly that row
+through the existing timeline API. Full text and IDs go through the same transformer; previews and
+truncated text never establish provenance. Failed source reads expose a retry control. Hosts without the capability keep their
 ordinary outline when no such policy is active; they need the new contract to show a filtered outline.
 Live refreshes request only prompts after the cached cursor. Source bodies are never persisted by
 the outline, and assistant history, attachments, or extra metadata are not part of this projection.
@@ -472,11 +474,15 @@ plugin configuration, and plugin profile-loading code remain untouched. Update b
 assets only after the server contract is active; retain the previous static directory for rollback.
 The runtime patch does not update TypeScript declarations or restart a service.
 
-A user-message display policy omits any outline entry whose full source exceeds 64 KiB, including
-ordinary input. Its transcript stays visible when the transformer allows it. This bounds transfer
-without substituting a truncated body for an exact hash check; removing the policy restores the
-ordinary preview-only outline. The 64 KiB limit applies to the serialized source item, not preview
-length.
+Fallback source reads are serial and view-scoped. They fetch one projected row per missing source
+without loading adjacent history into the transcript, and cache only user text and existing IDs in
+memory. Ordinary oversized inputs retain navigation when the transformer allows them. Removing
+the policy restores preview-only navigation without source reads. A host without the new source
+capability still needs the compatibility patch before a filtered outline is enabled.
+
+An authenticated `workspace.read` session can show ordinary history without `daemon.manage`.
+Losing catalog management removes prior plugin contributions; it does not grant catalog access.
+Rejected credentials and removed hosts continue to clear the display trust scope.
 
 Transformers run synchronously and must be deterministic. When several transformers match, the
 first one that returns a result owns that source item. Plugin and registration ordering is stable.

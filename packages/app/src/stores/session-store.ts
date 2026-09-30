@@ -692,6 +692,7 @@ function isSessionServerInfoUnchanged(input: {
   nextDesktopManaged: boolean | undefined;
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
+  nextPermissions: ServerInfoStatusPayload["permissions"] | undefined;
   nextServerId: string;
 }): boolean {
   const {
@@ -701,6 +702,7 @@ function isSessionServerInfoUnchanged(input: {
     nextDesktopManaged,
     nextCapabilities,
     nextFeatures,
+    nextPermissions,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
@@ -710,7 +712,8 @@ function isSessionServerInfoUnchanged(input: {
     prevVersion === nextVersion &&
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
     areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
-    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures)
+    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures) &&
+    JSON.stringify(currentServerInfo?.permissions) === JSON.stringify(nextPermissions)
   );
 }
 
@@ -848,6 +851,7 @@ export const useSessionStore = create<SessionStore>()(
           const nextDesktopManaged = info.desktopManaged;
           const nextCapabilities = info.capabilities;
           const nextFeatures = info.features;
+          const nextPermissions = info.permissions;
 
           if (
             isSessionServerInfoUnchanged({
@@ -857,6 +861,7 @@ export const useSessionStore = create<SessionStore>()(
               nextDesktopManaged,
               nextCapabilities,
               nextFeatures,
+              nextPermissions,
               nextServerId: info.serverId,
             })
           ) {
@@ -878,6 +883,7 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  ...(nextPermissions !== undefined ? { permissions: [...nextPermissions] } : {}),
                 },
               },
             },
