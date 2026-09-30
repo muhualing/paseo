@@ -1,0 +1,77 @@
+{
+  "version": "0.10.2",
+  "files": [
+    {
+      "package": "server",
+      "path": "dist/server/server/agent/timeline-prompt-index.js",
+      "originalSha256": "6332d669361fed186846cb3987351e7e72abc83a47d62e8d8ea9cf4de5c4faac",
+      "patchedSha256": "b214d89a847cedd886e8bccb0fd9537b2c5a29b6502e27668b4425e295a799d1",
+      "replacements": [
+        [
+          "export function buildTimelinePromptIndex(epoch, rows) {",
+          "export function buildTimelinePromptIndex(epoch, rows, options = {}) {\n    if (options.includeItems) {\n        const candidates = rows.filter((row) => row.item.type === \"user_message\" &&\n            (options.cursor === undefined || row.seq > options.cursor));\n        const prompts = [];\n        let bytes = 0;\n        for (const row of candidates) {\n            const size = Buffer.byteLength(JSON.stringify(row.item));\n            if (prompts.length >= 50 || (prompts.length > 0 && bytes + Math.min(size, 65536) > 262144)) break;\n            prompts.push({seq: row.seq, timestamp: row.timestamp, preview: promptPreview(row.item.text),\n                ...(size <= 65536 ? {item: {type: row.item.type, text: row.item.text,\n                    ...(row.item.messageId !== undefined ? {messageId: row.item.messageId} : {}),\n                    ...(row.item.clientMessageId !== undefined ? {clientMessageId: row.item.clientMessageId} : {})}} : {})});\n            bytes += Math.min(size, 65536);\n        }\n        return {epoch, prompts, nextCursor: prompts.length < candidates.length ? prompts[prompts.length - 1].seq : null};\n    }\n"
+        ]
+      ]
+    },
+    {
+      "package": "server",
+      "path": "dist/server/server/session.js",
+      "originalSha256": "c2f86382599d05db9311a858b3883fca00e8c3c63658c91cd04521a85a0c9981",
+      "patchedSha256": "b2cde4a8812c0a7c684d97a74acafc3c81e0c0068677a3cadc79c953f4f38be3",
+      "replacements": [
+        [
+          "const index = buildTimelinePromptIndex(timeline.epoch, rows);",
+          "const index = buildTimelinePromptIndex(timeline.epoch, rows, msg);"
+        ]
+      ]
+    },
+    {
+      "package": "server",
+      "path": "dist/server/server/websocket-server.js",
+      "originalSha256": "32d179ee4c489281a223e793f94ad0b8f59f50a8794461415179bf9d035a912a",
+      "patchedSha256": "b1a1089e6fa62c90ba4df39df0fd62386a75c29aa651b2bc08999668043ca6fe",
+      "replacements": [
+        [
+          "                agentTimelinePromptIndex: true,",
+          "                agentTimelinePromptIndex: true,\n                agentTimelinePromptDisplayItems: true,"
+        ]
+      ]
+    },
+    {
+      "package": "protocol",
+      "path": "dist/messages.js",
+      "originalSha256": "1fd419e84dd53544347e62aae94784c0db050156f265627c8be6f73a39f935f0",
+      "patchedSha256": "57d805867db0df163aa30fe214a867ccdefcfb83afd5b356245c1f0954c30c39",
+      "replacements": [
+        [
+          "export const AgentTimelineListPromptsRequestMessageSchema = z.object({\n    type: z.literal(\"agent.timeline.list_prompts.request\"),\n    agentId: z.string(),\n    requestId: z.string(),\n});",
+          "export const AgentTimelineListPromptsRequestMessageSchema = z.object({\n    type: z.literal(\"agent.timeline.list_prompts.request\"),\n    agentId: z.string(),\n    requestId: z.string(),\n    includeItems: z.boolean().optional(),\n    cursor: z.number().int().nonnegative().optional(),\n});"
+        ],
+        [
+          "export const AgentTimelineListPromptsResponseMessageSchema = z.object({\n    type: z.literal(\"agent.timeline.list_prompts.response\"),\n    payload: z.object({\n        requestId: z.string(),\n        agentId: z.string(),\n        epoch: z.string(),\n        prompts: z.array(z.object({\n            seq: z.number().int().nonnegative(),\n            timestamp: z.string(),\n            preview: z.string(),\n        })),\n        error: z.string().nullable(),\n    }),\n});",
+          "export const AgentTimelineListPromptsResponseMessageSchema = z.object({\n    type: z.literal(\"agent.timeline.list_prompts.response\"),\n    payload: z.object({\n        requestId: z.string(),\n        agentId: z.string(),\n        epoch: z.string(),\n        prompts: z.array(z.object({\n            seq: z.number().int().nonnegative(),\n            timestamp: z.string(),\n            preview: z.string(),\n            item: z.object({type: z.literal(\"user_message\"), text: z.string(),\n                messageId: z.string().optional(), clientMessageId: z.string().optional()}).optional(),\n        })),\n        nextCursor: z.number().int().nonnegative().nullable().optional(),\n        error: z.string().nullable(),\n    }),\n});"
+        ],
+        [
+          "        agentTimelinePromptIndex: z.boolean().optional(),",
+          "        agentTimelinePromptIndex: z.boolean().optional(),\n        agentTimelinePromptDisplayItems: z.boolean().optional(),"
+        ]
+      ]
+    },
+    {
+      "package": "protocol",
+      "path": "dist/validation/ws-outbound.js",
+      "originalSha256": "24f56fbe45afae0922cbccf8be61e729c746ef2c4af9fffc6ed1c538e3842eba",
+      "patchedSha256": "f1b3bf9e287f12ea72ce8ce3734f0886cd7ab8ced683fbe8e2b5ac2cdcaa6f68",
+      "replacements": [
+        [
+          "import { WSOutboundMessageSchema }",
+          "import { AgentTimelineListPromptsResponseMessageSchema } from \"../messages.js\";\nimport { WSOutboundMessageSchema }"
+        ],
+        [
+          "    return wsOutboundValidator.safeParse(input);",
+          "    const result = wsOutboundValidator.safeParse(input);\n    if (!result.success) return result;\n    if (input?.type === \"session\" && input.message?.type === \"agent.timeline.list_prompts.response\") {\n        const message = AgentTimelineListPromptsResponseMessageSchema.safeParse(input.message);\n        if (!message.success) return message;\n        return {...result, data: {...result.data, message: message.data}};\n    }\n    return result;"
+        ]
+      ]
+    }
+  ]
+}

@@ -451,6 +451,33 @@ ordinary outline when no such policy is active; they need the new contract to sh
 Live refreshes request only prompts after the cached cursor. Source bodies are never persisted by
 the outline, and assistant history, attachments, or extra metadata are not part of this projection.
 
+For an installed 0.10.2 host, `scripts/patch-quiet-display-0.10.2.py` adds this runtime contract
+without replacing the package. It verifies the version, resolved protocol dependency, and full
+SHA256 of each target against `scripts/quiet-display-0.10.2.json` before writing. Unknown code is
+rejected. Run it against an offline installation with a backup directory outside the package roots:
+
+```sh
+python3 scripts/patch-quiet-display-0.10.2.py \
+  --server-root "$SERVER_PACKAGE_ROOT" --protocol-root "$PROTOCOL_PACKAGE_ROOT" \
+  --backup-dir "$PATCH_BACKUP_DIR"
+node scripts/verify-quiet-display-0.10.2.mjs "$SERVER_PACKAGE_ROOT" "$PROTOCOL_PACKAGE_ROOT"
+```
+
+Repeating the patch is safe. Use the same arguments with `--check` to verify installation, or
+`--rollback` to restore the original target files. Backups are fingerprint-checked; subsequent
+unknown edits prevent rollback. File replacement is atomic, and write failures restore prior
+targets. Keep the installation offline during all five replacements; after process interruption,
+repeat application or rollback before starting it. All other package files, local provider patches,
+plugin configuration, and plugin profile-loading code remain untouched. Update browser static
+assets only after the server contract is active; retain the previous static directory for rollback.
+The runtime patch does not update TypeScript declarations or restart a service.
+
+A user-message display policy omits any outline entry whose full source exceeds 64 KiB, including
+ordinary input. Its transcript stays visible when the transformer allows it. This bounds transfer
+without substituting a truncated body for an exact hash check; removing the policy restores the
+ordinary preview-only outline. The 64 KiB limit applies to the serialized source item, not preview
+length.
+
 Transformers run synchronously and must be deterministic. When several transformers match, the
 first one that returns a result owns that source item. Plugin and registration ordering is stable.
 See `plugin-examples/timeline-items` for the complete contract.

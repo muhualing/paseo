@@ -1,5 +1,5 @@
 import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -84,6 +84,16 @@ async function waitForServer(port: number, child: ChildProcess): Promise<void> {
   );
 }
 
+async function resolveInstalledServerPackage(): Promise<string | undefined> {
+  const root = process.env.E2E_SERVER_PACKAGE_ROOT;
+  if (!root) return undefined;
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  if (manifest.name !== "@getpaseo/server" || manifest.version !== "0.10.2") {
+    throw new Error("Installed display-contract regression requires the published 0.10.2 server");
+  }
+  return root;
+}
+
 export async function startIsolatedHostDaemon(
   serverId: string,
   options: IsolatedHostDaemonOptions = {},
@@ -149,19 +159,41 @@ export async function startIsolatedHostDaemon(
       })}\n`,
     );
   }
-  const serverDir = publishedPackageRoot
-    ? path.join(publishedPackageRoot, "node_modules", "@getpaseo", "server")
-    : path.resolve(__dirname, "../../../../server");
+  const installedPackageRoot = await resolveInstalledServerPackage();
+  const serverDir =
+    installedPackageRoot ??
+    (publishedPackageRoot
+      ? path.join(publishedPackageRoot, "node_modules", "@getpaseo", "server")
+      : path.resolve(__dirname, "../../../../server"));
+  const inheritedEnvironment = installedPackageRoot
+    ? Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => !key.startsWith("PASEO_") && !/TOKEN|SECRET|PASSWORD|API_KEY/.test(key),
+        ),
+      )
+    : process.env;
   const spawnDaemon = async (): Promise<ChildProcess> => {
     const spawnOptions: SpawnOptions = {
       cwd: serverDir,
       env: withDisabledE2ESpeechEnv({
-        ...process.env,
+        ...inheritedEnvironment,
         ...options.environment,
+        ...(installedPackageRoot
+          ? {
+              HOME: paseoHome,
+              USERPROFILE: paseoHome,
+              XDG_CONFIG_HOME: path.join(paseoHome, ".config"),
+              CODEX_HOME: path.join(paseoHome, "codex-home"),
+            }
+          : {}),
         PASEO_HOME: paseoHome,
         PASEO_SERVER_ID: serverId,
         PASEO_LISTEN: `127.0.0.1:${port}`,
-        PASEO_CORS_ORIGINS: `http://localhost:${metroPort}`,
+        PASEO_CORS_ORIGINS:
+          process.env.E2E_INSTALLED_WEB_UI === "1"
+            ? `http://127.0.0.1:${port}`
+            : `http://localhost:${metroPort}`,
+        ...(process.env.E2E_INSTALLED_WEB_UI === "1" ? { PASEO_WEB_UI_ENABLED: "1" } : {}),
         PASEO_RELAY_ENABLED: options.mutableRelay ? undefined : "0",
         PASEO_NODE_ENV: "development",
         NODE_ENV: "development",
@@ -169,9 +201,10 @@ export async function startIsolatedHostDaemon(
       stdio: ["ignore", "ignore", "pipe"],
       detached: false,
     };
-    const child = publishedPackageRoot
-      ? spawn(process.execPath, ["dist/scripts/supervisor-entrypoint.js"], spawnOptions)
-      : spawnTsx("scripts/supervisor-entrypoint.ts", ["--dev"], spawnOptions);
+    const child =
+      publishedPackageRoot || installedPackageRoot
+        ? spawn(process.execPath, ["dist/scripts/supervisor-entrypoint.js"], spawnOptions)
+        : spawnTsx("scripts/supervisor-entrypoint.ts", ["--dev"], spawnOptions);
 
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
