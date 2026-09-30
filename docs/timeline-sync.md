@@ -25,6 +25,41 @@ to 64 KiB, and the same bounded item is used for runtime timeline rows and live 
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 
+## Server display policy
+
+The daemon applies the same display policy to history, live delivery, reconstruction,
+prompt navigation, search, and provider child transcripts. Clients need no plugin or
+capability opt-in. Explicit ordinary submission identity wins over historical approval.
+Native provider metadata cannot establish submission identity; historical approval requires
+both a native message ID and the exact complete text digest.
+
+Display positions have their own epoch and sequence space. Hidden source ranges do not
+advance that sequence, and pagination selects visible items before applying its limit.
+A held assistant prefix that grows into ordinary text is released in full. Existing
+catch-up and replacement messages reconcile it; no new client fields are required.
+History actions translate display checkpoints back to source checkpoints. Fork context
+and provider input still use the complete source transcript.
+
+Set `PASEO_TIMELINE_DISPLAY=raw` in the daemon environment to disable the policy and
+restore source display positions. Changing this setting requires a daemon restart; cached
+clients use the existing stale-epoch reset contract. The approved historical index is read
+once when a session is created from the daemon user's home. Its revision participates in
+the display epoch. Missing, malformed, insecure or concurrently modified indexes leave
+unverified history visible. Refresh an index by creating new sessions or restarting the
+daemon; retained sessions keep their initial validated snapshot.
+
+For an offline official 0.10.2 installation, apply the existing optional prompt contract
+and submitted prompt provenance patches first. Then run
+`python3 scripts/patch-server-display-0.10.2.py --server-root SERVER --backup-dir BACKUP`.
+Use `--check` to verify, or `--rollback` with the same external backup directory to restore
+only this patch. Unknown package versions, fingerprints and missing provenance prerequisites
+are refused before any write. Web assets, status timeout, stream deduplication and model
+capability patches are untouched. Verify the result with
+`node scripts/verify-server-display-0.10.2.mjs SERVER`; an optional second argument saves
+an isolated Chromium screenshot while checking the unchanged bundled 0.10.2 web client.
+The browser check demonstrates the older client protocol and renderer, not a physical
+phone installation.
+
 ## Presence is not delivery
 
 Client heartbeat reports presence:

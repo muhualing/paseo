@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import type { AgentTimelineItem } from "./agent-sdk-types.js";
+import { describe, expect, test, it } from "vitest";
 
 import type { AgentTimelineRow } from "./agent-manager.js";
 import {
@@ -776,5 +777,129 @@ describe("selectProjectedTimelinePage", () => {
 
     expect(page.entries.some((entry) => entry.item.type === "tool_call")).toBe(true);
     expect(page.endSeq).toBe(501);
+  });
+});
+
+import {
+  TimelineDisplay,
+  historicalDisplayRevision,
+  readHistoricalDisplayIndex,
+  textDigest,
+  isStandaloneQuietText,
+} from "./timeline-display.js";
+import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+describe("server timeline display", () => {
+  const nativeId = "fbd6bc94-215b-4ba4-b7fd-3abf2bf629d1";
+  const old = "[cto-watch 兜底] project=example issue=https://example.test/1\nevent";
+  const record = { nativeMessageId: nativeId, exactTextSha256: textDigest(old) };
+  const index = {
+    schemaVersion: 1 as const,
+    revision: historicalDisplayRevision([record]),
+    records: [record],
+  };
+  const raw = (items: AgentTimelineItem[]) => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("display", { items, epoch: "audit" });
+    return store.fetch("display", { limit: 0 });
+  };
+  it("requires both historical identity and exact text and preserves ordinary provenance", () => {
+    const source = raw([
+      { type: "user_message", text: old, messageId: nativeId },
+      { type: "user_message", text: old, messageId: "different" },
+      { type: "user_message", text: `${old}\nWhy?`, messageId: nativeId },
+      { type: "user_message", text: old, messageId: nativeId, clientMessageId: "ordinary" },
+      { type: "user_message", text: old, clientMessageId: "cto-watch:old" },
+      { type: "user_message", text: old },
+    ]);
+    const view = new TimelineDisplay(index).fetch(source, { limit: 0 });
+    expect(view.rows.map((row) => row.seq)).toEqual([1, 2, 3, 4]);
+    expect(view.rows.map((row) => row.item)).toEqual([
+      source.rows[1].item,
+      source.rows[2].item,
+      source.rows[3].item,
+      source.rows[5].item,
+    ]);
+    expect(source.window.maxSeq).toBe(6);
+    expect(new TimelineDisplay(null).fetch(source, { limit: 0 }).rows).toHaveLength(5);
+    expect(new TimelineDisplay(index, false).fetch(source, { limit: 0 }).epoch).toBe("audit");
+    expect(new TimelineDisplay(index, false).fetch(source, { limit: 0 }).rows).toEqual(source.rows);
+  });
+  it("keeps batched-format pastes and mismatched body digests visible", () => {
+    const text = "[cto-watch 事件] 按一手证据推进；自述需复验。\nfirst\nsecond";
+    const source = raw([
+      { type: "user_message", text, clientMessageId: `cto-watch:${textDigest(text)}` },
+      { type: "user_message", text, clientMessageId: "cto-watch:wrong" },
+      { type: "user_message", text, clientMessageId: "ordinary" },
+    ]);
+    expect(new TimelineDisplay(null).fetch(source).rows.map((row) => row.item)).toEqual(
+      source.rows.slice(1).map((row) => row.item),
+    );
+  });
+  it("suppresses every streaming marker prefix while retaining body, code examples and separators", () => {
+    const marker = "<cto-watch-quiet/>";
+    for (let length = 1; length <= marker.length; length++)
+      expect(isStandaloneQuietText(marker.slice(0, length), true)).toBe(true);
+    expect(isStandaloneQuietText("---\n<cto-watch-quiet/>\n___")).toBe(true);
+    expect(isStandaloneQuietText("  \n\t")).toBe(true);
+    for (const text of [
+      "---",
+      "    <cto-watch-quiet/>",
+      "`<cto-watch-quiet/>`",
+      `${marker}\nProgress: 3 checks passed`,
+      "<",
+    ])
+      expect(isStandaloneQuietText(text)).toBe(false);
+  });
+  it("pages across a completely hidden window and rejects cursors from another display revision", () => {
+    const source = raw(
+      Array.from({ length: 500 }, () => ({
+        type: "user_message" as const,
+        text: old,
+        clientMessageId: "cto-watch:old",
+      })),
+    );
+    const display = new TimelineDisplay(null);
+    const page = display.fetch(source, {
+      direction: "after",
+      cursor: { epoch: "audit:display-v1:unavailable", seq: 0 },
+      limit: 1,
+    });
+    expect(page.window).toEqual({ minSeq: 0, maxSeq: 0, nextSeq: 1 });
+    expect(page.rows).toEqual([]);
+    expect(page.hasNewer).toBe(false);
+    expect(page.hasOlder).toBe(false);
+    expect(display.fetch(source, { cursor: { epoch: "audit", seq: 1 } }).staleCursor).toBe(true);
+  });
+  it("accepts only a bounded, private, regular, revision-validated historical index", () => {
+    const directory = mkdtempSync(join(tmpdir(), "display-index-"));
+    const file = join(directory, "index.json");
+    try {
+      expect(readHistoricalDisplayIndex(file)).toBeNull();
+      writeFileSync(file, JSON.stringify(index), { mode: 0o600 });
+      expect(readHistoricalDisplayIndex(file)).toEqual(index);
+      symlinkSync(file, join(directory, "link"));
+      expect(readHistoricalDisplayIndex(join(directory, "link"))).toBeNull();
+      chmodSync(file, 0o644);
+      expect(readHistoricalDisplayIndex(file)).toBeNull();
+      chmodSync(file, 0o600);
+      for (const bad of [
+        { ...index, revision: "0".repeat(64) },
+        { ...index, records: [record, record] },
+        { ...index, records: [{ ...record, nativeMessageId: "not-native" }] },
+      ]) {
+        writeFileSync(file, JSON.stringify(bad));
+        expect(readHistoricalDisplayIndex(file)).toBeNull();
+      }
+      writeFileSync(file, Buffer.alloc(2 * 1024 * 1024 + 1));
+      expect(readHistoricalDisplayIndex(file)).toBeNull();
+      writeFileSync(file, Buffer.from([0xff]));
+      expect(readHistoricalDisplayIndex(file)).toBeNull();
+    } finally {
+      rmSync(directory, { recursive: true });
+    }
   });
 });

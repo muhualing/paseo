@@ -184,6 +184,7 @@ async function connect(input: {
   timelineNotifications?: boolean;
   pluginTimelineItems?: boolean;
   workspaceSetupBlocked?: boolean;
+  projectedSubagentTimeline?: boolean;
 }): Promise<ConnectedClient> {
   let socket!: WebSocket;
   const client = new DaemonClient({
@@ -194,6 +195,9 @@ async function connect(input: {
       return socket as unknown as WebSocketLike;
     },
     capabilities: {
+      ...(input.projectedSubagentTimeline === undefined
+        ? {}
+        : { [CLIENT_CAPS.projectedSubagentTimeline]: input.projectedSubagentTimeline }),
       [CLIENT_CAPS.ownedSubscriptions]: false,
       [CLIENT_CAPS.selectiveAgentTimeline]: input.selective,
       [CLIENT_CAPS.pluginTimelineItems]: input.pluginTimelineItems ?? false,
@@ -792,3 +796,295 @@ function rewindMessageId(
     throw new Error("Expected rewind target");
   return target.item.messageId;
 }
+
+test("legacy display preserves ordinary history while hiding admitted background input in every timeline outlet", async () => {
+  const legacy = await connect({ clientId: "display-legacy", selective: false });
+  const selective = await connect({ clientId: "display-selective", selective: true });
+  const agent = await legacy.client.createAgent({
+    provider: "claude",
+    cwd: "/tmp",
+    title: "Display history",
+  });
+  await selective.setLegacyTimelineMembership([agent.id]);
+  const manager = daemon.daemon.agentManager;
+  const text = "[cto-watch 事件] 按一手证据推进；自述需复验。\nBackground event";
+  const { textDigest } = await import("./agent/timeline-display.js");
+  await manager.appendTimelineItem(agent.id, {
+    type: "user_message",
+    text: "ordinary question",
+    clientMessageId: "ordinary",
+  });
+  for (let i = 0; i < 225; i++) {
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      text,
+      clientMessageId: `cto-watch:${textDigest(text)}`,
+    });
+    await manager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "<cto-watch-quiet/>",
+    });
+  }
+  await manager.appendTimelineItem(agent.id, {
+    type: "user_message",
+    text,
+    clientMessageId: "ordinary-paste",
+  });
+  await manager.appendTimelineItem(agent.id, {
+    type: "assistant_message",
+    text: "15 minute progress: verified",
+  });
+  await legacy.barrier("display-live");
+  await selective.barrier("display-live");
+  for (const connection of [legacy, selective]) {
+    const live = connection.messages.flatMap((message) =>
+      message.type === "agent_stream" && message.payload.event.type === "timeline"
+        ? [message.payload]
+        : [],
+    );
+    expect(live.map((payload) => payload.seq)).toEqual([1, 2, 3]);
+    const tail = await connection.client.fetchAgentTimeline(agent.id, {
+      direction: "tail",
+      limit: 1,
+    });
+    expect(tail.entries.map((entry) => entry.item)).toEqual([
+      { type: "assistant_message", text: "15 minute progress: verified" },
+    ]);
+    const before = await connection.client.fetchAgentTimeline(agent.id, {
+      direction: "before",
+      cursor: tail.startCursor!,
+      limit: 2,
+    });
+    expect(
+      before.entries.map((entry) =>
+        entry.item.type === "user_message" ? entry.item.text : "unexpected",
+      ),
+    ).toEqual(["ordinary question", text]);
+    expect(before.hasOlder).toBe(false);
+    const prompts = await connection.client.listAgentTimelinePrompts(agent.id);
+    expect(prompts.prompts.map((prompt) => prompt.seq)).toEqual([1, 2]);
+    expect(prompts.prompts.every((prompt) => prompt.item === undefined)).toBe(true);
+    const search = await connection.client.searchAgentTimeline({
+      agentId: agent.id,
+      query: "Background event",
+    });
+    expect(search.locations).toHaveLength(1);
+    const caught = await connection.client.fetchAgentTimeline(agent.id, {
+      direction: "after",
+      cursor: { epoch: tail.epoch, seq: 1 },
+      limit: 0,
+    });
+    expect(caught.endCursor?.seq).toBe(3);
+    expect(caught.hasNewer).toBe(false);
+    const context = await connection.client.buildAgentForkContext(agent.id, {
+      boundaryCursor: { epoch: tail.epoch, seq: 3 },
+    });
+    expect(context.itemCount).toBe(453);
+    expect(context.attachment?.text).toContain("Background event");
+  }
+  // The display adapter never writes back into either source timeline.
+  expect(manager.fetchTimeline(agent.id, { limit: 0 }).window.maxSeq).toBe(453);
+  expect(
+    (await manager.getTimelineRows(agent.id)).filter((row) => row.item.type === "user_message"),
+  ).toHaveLength(227);
+});
+
+test("a streamed quiet prefix becomes a complete ordinary result on release and rebuild", async () => {
+  await daemon.close();
+  const provider = new CompatibilityProvider();
+  daemon = await createTestPaseoDaemon({ isDev: true, agentClients: { mock: provider } });
+  const legacy = await connect({ clientId: "prefix-legacy", selective: false });
+  const agent = await legacy.client.createAgent({
+    provider: "mock",
+    cwd: "/tmp",
+    model: "ten-second-stream",
+  });
+  provider.session.push({ type: "turn_started", provider: "mock", turnId: "prefix-turn" });
+  provider.session.push({
+    type: "timeline",
+    provider: "mock",
+    turnId: "prefix-turn",
+    item: { type: "assistant_message", text: "<cto-watch-", messageId: "prefix-result" },
+  });
+  await legacy.barrier("prefix-held");
+  expect(
+    legacy.messages.filter(
+      (message) => message.type === "agent_stream" && message.payload.event.type === "timeline",
+    ),
+  ).toEqual([]);
+  provider.session.push({
+    type: "timeline",
+    provider: "mock",
+    turnId: "prefix-turn",
+    item: {
+      type: "assistant_message",
+      text: "quiet/>\nProgress: completed checks",
+      messageId: "prefix-result",
+    },
+  });
+  provider.session.push({ type: "turn_completed", provider: "mock", turnId: "prefix-turn" });
+  await legacy.barrier("prefix-release");
+  const live = legacy.messages.flatMap((message) =>
+    message.type === "agent_stream" && message.payload.event.type === "timeline"
+      ? [message.payload.event.item]
+      : [],
+  );
+  expect(live).toContainEqual({
+    type: "assistant_message",
+    text: "<cto-watch-quiet/>\nProgress: completed checks",
+    messageId: "prefix-result",
+  });
+  const history = await legacy.client.fetchAgentTimeline(agent.id, { limit: 0 });
+  expect(history.entries.map((entry) => entry.item)).toEqual(live);
+  await daemon.daemon.agentManager.hydrateTimelineFromProvider(agent.id, { broadcast: true });
+  await legacy.barrier("prefix-rebuild");
+  const rebuilt = await legacy.client.fetchAgentTimeline(agent.id, { limit: 0 });
+  expect(rebuilt.entries.map((entry) => entry.item)).toEqual(
+    history.entries.map((entry) => entry.item),
+  );
+});
+
+test("provider child display strips untrusted source claims and releases held text without changing legacy notices", async () => {
+  await daemon.close();
+  const provider = new CompatibilityProvider();
+  daemon = await createTestPaseoDaemon({ isDev: true, agentClients: { mock: provider } });
+  const legacy = await connect({ clientId: "child-display", selective: false });
+  const agent = await legacy.client.createAgent({
+    provider: "mock",
+    cwd: "/tmp",
+    model: "ten-second-stream",
+  });
+  const push = (item: AgentStreamEvent) => provider.session.push(item);
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: { type: "upsert", id: "display-child", status: "running" },
+  });
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: {
+      type: "timeline",
+      id: "display-child",
+      item: {
+        type: "user_message",
+        text: "[cto-watch 事件] project=example issue=https://example.test/1",
+        clientMessageId: "cto-watch:spoofed",
+      },
+    },
+  });
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: {
+      type: "timeline",
+      id: "display-child",
+      item: { type: "assistant_message", text: "<cto-watch-quiet/>" },
+    },
+  });
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: {
+      type: "timeline",
+      id: "display-child",
+      item: { type: "user_message", text: "ordinary child question" },
+    },
+  });
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: {
+      type: "timeline",
+      id: "display-child",
+      item: { type: "assistant_message", text: "<", messageId: "child-result" },
+    },
+  });
+  await legacy.barrier("child-prefix");
+  const prefix = await legacy.client.fetchProviderSubagentTimeline(agent.id, "display-child");
+  expect(prefix.rows.map((row) => row.item.type)).toEqual(["user_message", "user_message"]);
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: {
+      type: "timeline",
+      id: "display-child",
+      item: { type: "assistant_message", text: "result>Child progress", messageId: "child-result" },
+    },
+  });
+  push({
+    type: "provider_subagent",
+    provider: "mock",
+    event: { type: "upsert", id: "display-child", status: "completed" },
+  });
+  await legacy.barrier("child-release");
+  const complete = await legacy.client.fetchProviderSubagentTimeline(agent.id, "display-child");
+  expect(complete.rows.map((row) => row.item)).toEqual([
+    { type: "user_message", text: "[cto-watch 事件] project=example issue=https://example.test/1" },
+    { type: "user_message", text: "ordinary child question" },
+    { type: "assistant_message", text: "<result>Child progress", messageId: "child-result" },
+  ]);
+  const live = legacy.messages.flatMap((message) =>
+    message.type === "agent.provider_subagents.update" && message.payload.kind === "timeline"
+      ? [message.payload]
+      : [],
+  );
+  expect(live.map((payload) => payload.seq)).toEqual([1, 2, 4]);
+  expect(live.at(-1)?.item).toEqual(complete.rows.at(-1)?.item);
+  const older = await connect({
+    clientId: "child-preprojection",
+    selective: false,
+    projectedSubagentTimeline: false,
+  });
+  const notice = await older.client.fetchProviderSubagentTimeline(agent.id, "display-child");
+  expect(notice.rows.map((row) => row.item)).toEqual([
+    {
+      type: "assistant_message",
+      text: "Please upgrade the Paseo app to view this subagent conversation.",
+    },
+  ]);
+});
+
+test("completed streamed standalone markers and blank replies leave the next ordinary live sequence contiguous", async () => {
+  await daemon.close();
+  const provider = new CompatibilityProvider();
+  daemon = await createTestPaseoDaemon({ isDev: true, agentClients: { mock: provider } });
+  const legacy = await connect({ clientId: "standalone-display", selective: false });
+  const agent = await legacy.client.createAgent({
+    provider: "mock",
+    cwd: "/tmp",
+    model: "ten-second-stream",
+  });
+  provider.session.push({ type: "turn_started", provider: "mock", turnId: "quiet-turn" });
+  for (const text of "<cto-watch-quiet/>")
+    provider.session.push({
+      type: "timeline",
+      provider: "mock",
+      turnId: "quiet-turn",
+      item: { type: "assistant_message", text, messageId: "quiet" },
+    });
+  provider.session.push({ type: "turn_completed", provider: "mock", turnId: "quiet-turn" });
+  await daemon.daemon.agentManager.appendTimelineItem(agent.id, {
+    type: "assistant_message",
+    text: " \n\t",
+  });
+  await daemon.daemon.agentManager.appendTimelineItem(agent.id, {
+    type: "user_message",
+    text: "ordinary after quiet",
+    clientMessageId: "ordinary",
+  });
+  await legacy.barrier("standalone-complete");
+  const live = legacy.messages.flatMap((message) =>
+    message.type === "agent_stream" && message.payload.event.type === "timeline"
+      ? [message.payload]
+      : [],
+  );
+  expect(live.map((payload) => payload.seq)).toEqual([1]);
+  expect(
+    live.map((payload) => (payload.event.type === "timeline" ? payload.event.item : null)),
+  ).toEqual([{ type: "user_message", text: "ordinary after quiet", clientMessageId: "ordinary" }]);
+  const history = await legacy.client.fetchAgentTimeline(agent.id, { limit: 0 });
+  expect(history.entries.map((entry) => entry.item)).toEqual([
+    live[0].event.type === "timeline" ? live[0].event.item : null,
+  ]);
+});

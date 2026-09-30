@@ -4476,3 +4476,166 @@ describe("createAgentStreamReducerQueue", () => {
     expect(scheduler.size).toBe(0);
   });
 });
+
+import { TimelineDisplay, textDigest } from "../../../server/src/server/agent/timeline-display";
+import { InMemoryAgentTimelineStore } from "../../../server/src/server/agent/agent-timeline-store";
+
+describe("legacy reducers consume the server display view", () => {
+  it("keeps ordinary rows across hidden history, streaming, pagination, reload and stale cursors", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("display", {
+      epoch: "audit",
+      items: [{ type: "user_message", text: "old question", clientMessageId: "old" }],
+    });
+    const display = new TimelineDisplay(null);
+    const response = (direction: "tail" | "before" | "after", seq?: number, limit = 1) => {
+      const full = store.fetch("display", { limit: 0 });
+      const view = display.fetch(full, {
+        direction,
+        limit,
+        ...(seq === undefined ? {} : { cursor: { epoch: display.project(full).epoch, seq } }),
+      });
+      return {
+        ...baseTimelineInput.payload,
+        ...view,
+        startCursor: view.startSeq === null ? null : { seq: view.startSeq },
+        endCursor: view.endSeq === null ? null : { seq: view.endSeq },
+        entries: view.rows.map((row) => Object.assign({ provider: "claude" as const }, row)),
+      };
+    };
+    const first = processTimelineResponse({ ...baseTimelineInput, payload: response("tail") });
+    const text = "[cto-watch 事件] 按一手证据推进；自述需复验。\nprogress event";
+    for (let i = 0; i < 300; i++) {
+      store.append("display", {
+        type: "user_message",
+        text,
+        clientMessageId: `cto-watch:${textDigest(text)}`,
+      });
+      store.append("display", { type: "assistant_message", text: "<cto-watch-quiet/>" });
+    }
+    const row = store.append("display", {
+      type: "user_message",
+      text: "new question",
+      clientMessageId: "new",
+    });
+    const view = display.project(store.fetch("display", { limit: 0 }));
+    const live = processAgentStreamEvent({
+      ...baseStreamInput,
+      currentTail: first.tail,
+      currentHead: first.head,
+      currentCursor: first.cursor ?? undefined,
+      seq: view.mapSeq(row.seq),
+      epoch: view.epoch,
+      event: { type: "timeline", provider: "claude", item: row.item },
+    });
+    expect(live.sideEffects).toEqual([]);
+    expect(live.cursor?.endSeq).toBe(2);
+    expect(
+      live.tail.map((item) => (item.kind === "user_message" ? item.text : "unexpected")),
+    ).toEqual(["old question", "new question"]);
+    const tail = processTimelineResponse({ ...baseTimelineInput, payload: response("tail") });
+    const older = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: tail.tail,
+      currentHead: tail.head,
+      currentCursor: tail.cursor ?? undefined,
+      payload: response("before", 2),
+    });
+    expect(
+      [...older.head, ...older.tail].map((item) =>
+        item.kind === "user_message" ? item.text : "unexpected",
+      ),
+    ).toEqual(["old question", "new question"]);
+    expect(response("before", 2).hasOlder).toBe(false);
+    expect(response("after", 2).hasNewer).toBe(false);
+    const reload = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: live.tail,
+      currentCursor: live.cursor ?? undefined,
+      payload: { ...response("tail", undefined, 0), reset: true },
+    });
+    expect(
+      reload.tail.map((item) => (item.kind === "user_message" ? item.text : "unexpected")),
+    ).toEqual(["old question", "new question"]);
+    const stale = display.fetch(store.fetch("display", { limit: 0 }), {
+      cursor: { epoch: "audit", seq: 600 },
+      limit: 0,
+    });
+    expect(stale.reset).toBe(true);
+    expect(stale.staleCursor).toBe(true);
+    expect(stale.rows).toHaveLength(2);
+  });
+});
+
+it("legacy catch-up resolves one held-prefix gap without losing its text or requesting forever", () => {
+  const store = new InMemoryAgentTimelineStore();
+  store.initialize("display", {
+    epoch: "audit",
+    items: [{ type: "user_message", text: "question" }],
+  });
+  const display = new TimelineDisplay(null);
+  const initial = display.fetch(store.fetch("display", { limit: 0 }));
+  const first = processTimelineResponse({
+    ...baseTimelineInput,
+    payload: {
+      ...baseTimelineInput.payload,
+      ...initial,
+      direction: "tail",
+      startCursor: { seq: 1 },
+      endCursor: { seq: 1 },
+      entries: initial.rows.map((row) => Object.assign({ provider: "claude" as const }, row)),
+    },
+  });
+  store.append("display", { type: "assistant_message", text: "<cto-watch-", messageId: "result" });
+  expect(display.project(store.fetch("display", { limit: 0 }), true).rows).toHaveLength(1);
+  store.append("display", {
+    type: "assistant_message",
+    text: "quiet/>\nProgress: checks complete",
+    messageId: "result",
+  });
+  const view = display.project(store.fetch("display", { limit: 0 }));
+  const event = { type: "timeline" as const, provider: "claude" as const, item: view.rows[1].item };
+  const gap = processAgentStreamEvent({
+    ...baseStreamInput,
+    currentTail: first.tail,
+    currentCursor: first.cursor ?? undefined,
+    epoch: view.epoch,
+    seq: 3,
+    event,
+  });
+  expect(gap.sideEffects).toEqual([{ type: "catch_up", cursor: { epoch: view.epoch, endSeq: 1 } }]);
+  const page = display.fetch(store.fetch("display", { limit: 0 }), {
+    direction: "after",
+    cursor: { epoch: view.epoch, seq: 1 },
+    limit: 1,
+  });
+  const caught = processTimelineResponse({
+    ...baseTimelineInput,
+    currentTail: first.tail,
+    currentCursor: first.cursor ?? undefined,
+    payload: {
+      ...baseTimelineInput.payload,
+      ...page,
+      startCursor: { seq: page.startSeq! },
+      endCursor: { seq: page.endSeq! },
+      entries: page.rows.map((row) => Object.assign({ provider: "claude" as const }, row)),
+    },
+  });
+  expect(caught.cursor?.endSeq).toBe(3);
+  expect(caught.tail.map((item) => ("text" in item ? item.text : "unexpected"))).toEqual([
+    "question",
+    "<cto-watch-quiet/>\nProgress: checks complete",
+  ]);
+  expect(caught.sideEffects.some((effect) => effect.type === "catch_up")).toBe(false);
+  expect(page.hasNewer).toBe(false);
+  const repeated = processAgentStreamEvent({
+    ...baseStreamInput,
+    currentTail: caught.tail,
+    currentCursor: caught.cursor ?? undefined,
+    epoch: view.epoch,
+    seq: 3,
+    event,
+  });
+  expect(repeated.sideEffects).toEqual([]);
+  expect(repeated.tail).toEqual(caught.tail);
+});
